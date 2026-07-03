@@ -49,7 +49,7 @@ Extract all prescribed procedures, protocols, methods, treatments, plans, or wor
 Extract every significant date, time, deadline, milestone, or event.
 
 ### A8: Negative Checklist
-MANDATORY — at least 5 items. Scan every page for facts explicitly stated as NOT present, ruled out, normal, satisfactory, negative, or absent. This list is used to detect student fabrication.
+Scan every page for facts explicitly stated as NOT present, ruled out, normal, satisfactory, negative, or absent. When the materials contain such statements (typical for clinical or case worksheets), extract EVERY one — usually at least 5. If the materials contain NO such statements (e.g. a maths quiz answer key or an essay prompt), output an empty list []. NEVER invent items to reach a minimum: this list is used to detect student fabrication, so an invented item can wrongly penalise a correct student answer.
 
 ### A9: Assignment Type
 Classify the assignment and write the result into the top-level `"assignment_type"` field. Choose the closest match: "essay_or_argumentative_writing", "clinical_or_case_worksheet", "math_or_calculation_problem_set", "science_lab_or_technical_report", "data_extraction_or_analysis", "short_answer_or_quiz", "project_or_presentation", or a short free-text label if none fit. The grading agent uses this to decide how strictly to fact-check.
@@ -64,7 +64,7 @@ For each key concept, decision, or judgement in the model answer:
 
 ## Task 3 — Extract Prioritisation and Reasoning Logic (from model answer)
 
-MANDATORY FORMAT — Each list must have 3-4 specific items with clear labels or classifications. Do NOT write vague summaries.
+FORMAT — when the model answer defines stages/phases or prioritisation logic, each list must have 3-4 specific items with clear labels or classifications; do NOT write vague summaries. If the assignment genuinely has no stages or prioritisation logic (e.g. a maths quiz or a single essay), leave these lists empty [] — never invent entries.
 
 Extract:
 - Expected answers or conclusions at each stage/phase
@@ -99,13 +99,15 @@ Classify `standard_type` as one of (or a comma-separated combination for hybrids
 - "grade_bands" — holistic letter grades or level bands (e.g. A–E, Distinction/Merit/Pass, 优/良/合格) with descriptors for each band
 - "checklist" — pass/fail or present/absent criteria
 - "holistic" — a single overall judgement guided by narrative descriptors
-If it combines several (e.g. per-question marks that map to a final letter grade), record every component and use "hybrid: <component types>".
+If it combines several genuinely distinct scoring methods (e.g. per-question marks PLUS a separately written rubric), record every component and use "hybrid: <component types>".
+EXCEPTION — per-question marks whose TOTAL is merely mapped to letter or band cutoffs (e.g. A ≥ 27, B ≥ 21, C ≥ 15) is NOT a hybrid: classify it as "points_per_item" and record the cutoffs in `aggregation.grade_boundaries` and the letters in `aggregation.overall_labels`. Use a grade_bands component only when the standard actually writes descriptors for the bands.
+TIE-BREAK — if band labels (letters, Distinction/Merit/Pass, 优/良/合格) are applied per dimension, i.e. there is a descriptor for each dimension × band cell, classify as "rubric_matrix" and record the band labels as `scale.levels` (with `scale.type` "letter" or "band_label"). Use "grade_bands" ONLY for a standard with no dimensions: one single set of band descriptors judging the whole work.
 
 ### 7.2 Scale
 Record the exact scale in `scale`: the `type` ("numeric", "letter", "band_label", "percentage", "pass_fail"), the complete ORDERED list of `levels` from lowest to highest (e.g. [1,2,3,4,5,6] or ["E","D","C","B","A"] or ["不合格","合格","良","优"]), `min` and `max` where numeric, and the `pass_threshold` if one is stated.
 
-### 7.3 Dimensions (for rubric_matrix and grade_bands)
-For EVERY scoring dimension, domain, or criterion: the exact name as written, its weight or maximum score, and the VERBATIM descriptor for EVERY level of the scale — including all middle levels. Extract all sub-dimensions. For grade_bands with no dimensions, create one dimension named "Overall" holding every band descriptor.
+### 7.3 Dimensions (for rubric_matrix; grade_bands uses a single "Overall" dimension)
+For EVERY scoring dimension, domain, or criterion: the exact name as written, its weight or maximum score, and the VERBATIM descriptor for EVERY level of the scale — including all middle levels. Extract all sub-dimensions. For grade_bands standards, create one dimension named "Overall" holding every band descriptor. If a band has only a numeric cutoff and no written descriptor, do NOT invent a descriptor for it — the cutoff belongs in `aggregation.grade_boundaries`.
 
 ### 7.4 Item-level marking scheme (for points_per_item)
 For EVERY question or task item: `item_id` (question number), the question text or task, `max_marks`, each individual marking point with the marks it carries (e.g. "correct method: 2 marks", "correct final answer with units: 1 mark"), partial credit rules, the correct answer or all acceptable answers, and any listed common wrong answers with the marks they receive. Every question in the assignment must appear here — do not stop after the first few.
