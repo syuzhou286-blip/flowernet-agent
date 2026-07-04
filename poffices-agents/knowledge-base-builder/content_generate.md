@@ -108,6 +108,7 @@ Record the exact scale in `scale`: the `type` ("numeric", "letter", "band_label"
 
 ### 7.3 Dimensions (for rubric_matrix; grade_bands uses a single "Overall" dimension)
 For EVERY scoring dimension, domain, or criterion: the exact name as written, its weight or maximum score, and the VERBATIM descriptor for EVERY level of the scale — including all middle levels. Extract all sub-dimensions. For grade_bands standards, create one dimension named "Overall" holding every band descriptor. If a band has only a numeric cutoff and no written descriptor, do NOT invent a descriptor for it — the cutoff belongs in `aggregation.grade_boundaries`.
+Copy each level descriptor CHARACTER-FOR-CHARACTER. Do NOT compress a multi-clause descriptor into a single sentence, and do NOT drop its concrete markers — counts (e.g. "2 处以内"), thresholds, examples, or the point range for that level. These markers are what the grading agent uses to tell one band from the next; losing them makes the standard unusable. Extract the point range or max score per dimension AND per level whenever the rubric states one (e.g. "内容 17–20 分为优秀"); leave `max_score` blank only if the rubric truly gives no numbers.
 
 ### 7.4 Item-level marking scheme (for points_per_item)
 For EVERY question or task item: `item_id` (question number), the question text or task, `max_marks`, each individual marking point with the marks it carries (e.g. "correct method: 2 marks", "correct final answer with units: 1 mark"), partial credit rules, the correct answer or all acceptable answers, and any listed common wrong answers with the marks they receive. Every question in the assignment must appear here — do not stop after the first few.
@@ -116,7 +117,7 @@ For EVERY question or task item: `item_id` (question number), the question text 
 How the final result is computed: `method` (sum, weighted average, lowest dimension, holistic judgement, etc.), `total_possible`, `grade_boundaries` or band cut-offs (e.g. "A: ≥ 90%", "Pass: ≥ 40/60") as an ordered list, `rounding_rules`, and the `overall_labels` used for the final result if they differ from the per-dimension scale.
 
 ### 7.6 Deductions and special rules
-All penalties (lateness, missing units, wrong significant figures, exceeding word limits), bonus rules, automatic-zero conditions, and any gating rules such as "must pass dimension X to pass overall".
+All penalties (lateness, missing units, wrong significant figures, exceeding or falling short of word limits), bonus rules, automatic-zero conditions, and any gating rules such as "must pass dimension X to pass overall" or "偏题不予通过". Extract quantified penalty rules EXACTLY, keeping the numbers (e.g. "字数每少 50 字扣 1 分，最多扣 3 分") — never generalize a quantified rule down to "扣减相应分数" / "deduct accordingly".
 
 ### 7.7 Verbatim excerpts
 Quote, exactly as written, the 3-5 sentences of the grading standard that are most decisive for scoring (e.g. the definition of the top band, the pass condition, a strict penalty rule).
