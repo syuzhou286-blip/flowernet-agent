@@ -340,10 +340,14 @@ class DocumentGenerationOrchestrator:
         )
         inline_reference = re.compile(r"(?is)\s*(?:\*\*)?\s*(?:references?|bibliography|参考文献)\s*(?:\*\*)?\s*[:：]?\s*(?:\[\d+\].*)$")
         inline_meta = re.compile(r"(?is)\s*(?:---\s*)?(?:\*\*)?\s*(?:论证链实现说明|结构优化|写作说明|生成说明|质量检查说明)\s*(?:\*\*)?\s*[:：]?.*$")
+        # Also strip bracketed model notes (【说明】/【内容说明】…) and inline
+        # word-count annotations （字数：398）, which leaked into exported prose.
+        bracket_meta = re.compile(r"^\s*(?:#{1,6}\s*)?【\s*(?:内容说明|说明|写作说明|生成说明|字数统计|质量检查|论证链实现说明)\s*】\s*[:：]?.*$")
+        word_count = re.compile(r"[（(]\s*字数\s*[:：]?\s*\d+\s*字?\s*[)）]")
 
         for raw_line in lines:
             stripped = raw_line.strip()
-            if reference_heading.match(stripped) or meta_heading.match(stripped):
+            if reference_heading.match(stripped) or meta_heading.match(stripped) or bracket_meta.match(stripped):
                 skip_rest = True
                 continue
             if skip_rest:
@@ -355,6 +359,7 @@ class DocumentGenerationOrchestrator:
         text = "\n".join(cleaned).strip()
         text = re.sub(r"(?is)\n\s*(?:---\s*)?(?:\*\*)?\s*(?:论证链实现说明|结构优化|写作说明|生成说明|质量检查说明)\s*(?:\*\*)?\s*[:：]?.*$", "", text).strip()
         text = re.sub(r"(?is)\n\s*(?:\*\*)?\s*(?:references?|bibliography|参考文献)\s*(?:\*\*)?\s*[:：]?\s*(?:\[\d+\].*)$", "", text).strip()
+        text = word_count.sub("", text).strip()
         return text
 
     def _limit_subsection_draft_length(self, draft: str) -> str:
