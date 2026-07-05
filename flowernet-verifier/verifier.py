@@ -110,7 +110,10 @@ class FlowerNetVerifier:
         # 4. 权重融合 
         # 关键词覆盖度 (0.4) + 语义相似度 (0.4) + 主题一致性 (0.2)
         total_relevancy = (keyword_coverage * 0.4) + (semantic_sim * 0.4) + (topic_consistency * 0.2)
-        
+        # Clamp to [0,1]: individual components can exceed 1.0, which previously
+        # let relevancy scores like 1.009 leak out and blur the rel>=threshold gate.
+        total_relevancy = max(0.0, min(1.0, total_relevancy))
+
         return {
             "score": float(round(total_relevancy, 4)),
             "details": {

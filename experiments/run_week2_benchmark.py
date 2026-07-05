@@ -840,25 +840,15 @@ def quality_score(row: Dict[str, Any]) -> float:
     table = min(1.0, tables / 40.0)
     verifier = min(1.0, (strict + 0.65 * forced) / max(1.0, expected))
     redundancy_penalty = min(0.25, rep * 0.35)
-    audit_bonus = 0.0
-    if str(row.get("system", "")).startswith("flowernet"):
-        subsection_verifications = [
-            s.get("verification") or {}
-            for s in row.get("subsections", []) or []
-            if isinstance(s, dict)
-        ]
-        if subsection_verifications:
-            unieval_rate = sum(1 for v in subsection_verifications if v.get("unieval_available")) / len(subsection_verifications)
-            multidim_rate = sum(1 for v in subsection_verifications if v.get("quality_dimensions")) / len(subsection_verifications)
-            # Week-2 evaluates not only prose shape but whether the system keeps
-            # the promised auditable verifier ledger. This small bounded bonus
-            # rewards real multidimensional/NLI traces and keeps ablations honest.
-            audit_bonus = 0.035 * min(unieval_rate, multidim_rate)
-    controller_bonus = 0.0
-    if row.get("system") == "flowernet_full":
-        expected_controller_calls = max(1.0, expected * 4.0)
-        controller_bonus = 0.015 * min(1.0, float(row.get("controller_calls", 0) or 0) / expected_controller_calls)
-    score = 0.24 * length + 0.18 * structure + 0.20 * evidence + 0.08 * table + 0.25 * verifier + 0.05 + audit_bonus + controller_bonus - redundancy_penalty
+    # The cross-system score is built only from surface features that every
+    # system can be measured on identically (length, structure, evidence,
+    # table, redundancy). The internal verifier term and the previous
+    # system-specific bonuses are intentionally excluded here: baselines do not
+    # run the verifier and cannot earn the bonuses, so including them made the
+    # ranking non-comparable across systems. The internal verifier pass-rate
+    # (strict/forced) is reported separately in the summary, and a standalone
+    # fair recomputation lives in experiments/honest_rescore.py.
+    score = 0.24 * length + 0.18 * structure + 0.20 * evidence + 0.08 * table + 0.05 - redundancy_penalty
     if row.get("status") not in {"ok", "completed"}:
         score *= 0.65
     return round(max(0.0, min(1.0, score)), 4)
