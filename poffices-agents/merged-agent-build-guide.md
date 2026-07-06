@@ -136,3 +136,28 @@ grade
    提示先建库，而不是乱打分。
 
 跑通后，把所有 `teacher_1` 换成平台登录用户ID，即支持多老师。
+
+---
+
+## 6. 排障：不管传什么都得到 grader 的 "No grading standard found"
+
+**症状**：上传材料、query 写“update the knowledge base”，却收到 grader 的
+“⚠ No grading standard found…”报告（Overall Performance Summary / Key Priorities…）。
+
+**这不是 grader 或 rubric 检测的 bug。** 那份报告本身就是 Grade 分支（then）的输出——
+说明请求被**错误路由到了 Grade 分支**，拿你上传的材料当“学生作业”去批一个空 KB。
+Update 分支根本没跑，所以什么都没写进抽屉，KB 一直空。grader 对空 KB 说“没有标准”是**正确反应**。
+
+**根因**：If 条件 `!{layer_name_intent_output}.includes("update")` **恒为 true**，即
+`{layer_name_intent_output}` 里不含 "update" —— token 要么是空，要么分类器没输出 `update_kb`。
+
+**排查顺序**：
+1. 看运行记录里 `intent`（分类）节点**实际输出了什么**，应恰好是 `update_kb`。
+   - 输出为空 / 不是 update_kb → 分类器 Prompt 的问题：确认是完整英文分类指令
+     （`[Instructions] … update_kb / grade … --- ## Input`），不是只有 `'User_Query': {query}`。
+   - 输出确实是 update_kb 却仍走 grade → If 里的 token 没解析成它（取到空 → 恒 true）。
+2. ⚠️ `{layer_name_<name>_output}` 这套命名是给 **Text Generation / LLM 卡**用的
+   （read-md、extract_kb、combine_kb 都是）。**Input Analysis 是另一种卡，其输出 token
+   不一定叫 `{layer_name_intent_output}`** → If 取到空 → 每次都走 Grade。
+   **最稳修法**：分类器改用一张 **Text Generation 卡**（跟 combine_kb 同类型），instance 名 `intent`，
+   Prompt 放英文分类指令 —— 它的输出 `{layer_name_intent_output}` 就会像其它卡一样正常解析。
