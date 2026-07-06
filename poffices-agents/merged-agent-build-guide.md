@@ -161,3 +161,20 @@ Update 分支根本没跑，所以什么都没写进抽屉，KB 一直空。grad
    不一定叫 `{layer_name_intent_output}`** → If 取到空 → 每次都走 Grade。
    **最稳修法**：分类器改用一张 **Text Generation 卡**（跟 combine_kb 同类型），instance 名 `intent`，
    Prompt 放英文分类指令 —— 它的输出 `{layer_name_intent_output}` 就会像其它卡一样正常解析。
+
+## 7. 排障：建库分支跑了，但 KB 全是空的
+
+**症状**：走进了 else（建库）分支，但输出的 KB 每个字段都空，`assignment_type` /
+各处都是 "not provided in these materials"，`provided: false`。
+
+**原因**：提取器（extract_kb）的 `main_paper_text` = `{layer_name_read-md_output}` 是空的 ——
+上传文件的文本没进到提取器。schema 字段名、status_message 都正常（说明 prompt 加载没问题），
+唯独**源内容为空**。
+
+**排查**：
+1. 确认这次**真的附上了文件**（只打字、没传文件 → metadata 解析为空 → 空 KB）。
+2. 看运行记录里 **read-md（Metadata Extraction）** 那步的 Result：
+   - Result 为空 → 文件没被解析（文件上传 / `{file_urls}`、`{file_db_idx}` 这一环的问题）。
+   - Result 有文件文字 → extract_kb 没读到它：检查 extract_kb 里 `main_paper_text` 引用的
+     `{layer_name_read-md_output}` token 名是否和 read-md 卡的真实输出 token 完全一致。
+3. 即使内容进来了，`provided` 仍为 false 说明上传的文件里没有评分标准 —— 需要传含 rubric 的文件。
