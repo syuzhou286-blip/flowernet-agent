@@ -13,11 +13,14 @@ Context Key 先全部写死 `teacher_1`，跑通后再换成平台登录用户ID
 3. **If 条件匹配 `update` 不是 `upload`**：`!{layer_name_intent_output}.includes("update")`
 4. **合并卡输出改成纯 JSON**（已在 `reference_rules` 里改好），并且
    **Text Merge(13) 回执引用 `{layer_name_combine_kb_output}`**（不是 `{layer_name_gen-docx1_output}`）。
-5. **三张储物格卡的 Context Key 必须完全一致** —— Read(6)、Read(2)、Write(3) 全部用
-   **纯文本 `teacher_1`（不要花括号 `{}`）**。`{teacher_1}` 是"变量 teacher_1 的值"（你没定义→解析成空），
-   和纯文本 `teacher_1` 是不同的储物格钥匙。若 Write 用 `{teacher_1}` 而 Read(6) 用 `teacher_1`，
-   建好的库会存到别的格子里，打分时读不到 → 误以为建库失败。多老师时再统一换成 `{user_id}`，
-   但三处必须一模一样。
+5. **三张储物格卡的 Context Key 必须完全一致** —— Read(6)、Read(2)、Write(3) 用同一把钥匙。
+   两种写法二选一，别混用：
+   - 做法 A（推荐单老师 demo）：三处都用**纯文本 `teacher_1`**（不加花括号，也不用定义变量）。
+   - 做法 B（师兄那套）：三处都用 `{teacher_1}`，**并且**像师兄的 demo 那样加一张 Text Merge
+     定义变量 `teacher_1`（`{ "teacher_1": "teacher_1" }`）。花括号 `{teacher_1}` = "变量 teacher_1 的值"，
+     不定义就解析成空。
+   你现在是混用（Read6=纯文本、Read2/Write3=`{teacher_1}` 且没定义变量），存和读对不上 →
+   建好的库打分时读不到，会误以为建库失败。多老师时走做法 B，把变量换成平台登录ID `{user_id}`。
 
 ---
 
@@ -75,7 +78,7 @@ Context Key 先全部写死 `teacher_1`，跑通后再换成平台登录用户ID
 | **Text Generation (9) extract_kb** | Prompt=`{agent_content_generate}`；`main_paper_text`={layer_name_read-md_output} | `{layer_name_extract_kb_output}` = 草稿KB(纯JSON) | Text Gen(12) |
 | **Text Generation (12) combine_kb** | Prompt=`{reference_rules}`；`draft`={layer_name_extract_kb_output}；`existing_knowledge_base`={existing_kb} | `{layer_name_combine_kb_output}` = 最终KB(纯JSON) | Write(3) |
 | **Agent Variable Write (3)** | Key=`image_rules`；Ctx=`teacher_1`；VALUE=`{layer_name_combine_kb_output}`；Output=`writeSuccess` | `{writeSuccess}` = yes/no | Text Merge(13) |
-| **Text Merge (13)** | INPUT=`{layer_name_combine_kb_output}`；✓Content to user | 回执 | 结束（给老师） |
+| **Text Merge (13)** | INPUT 回执三选一：`{writeSuccess}`（只显示 yes，最省事）／`{layer_name_combine_kb_output}`（含 ✅/❌ 状态但一坨JSON）／推荐加一张小状态卡只输出 `status_message`；✓Content to user | 回执 | 结束（给老师） |
 
 > 变量槽分配（三个 prompt 互不同名，`image_rules` 留作 KB 储物格）：
 > `agent_content_generate`=建库提取 · `reference_rules`=建库合并 · `agent_knowledge`=批改。
