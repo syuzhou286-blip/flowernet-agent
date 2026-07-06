@@ -23,11 +23,11 @@ First-batch handling: if the existing knowledge base input is empty, missing, or
 
 After merging, run these checks and add warnings to a "warnings" array if any fail:
 
-CHECK G1 (BLOCKING) — `grading_standard_status.provided` must be true. If false, the FIRST LINE of Part 1 must be:
+CHECK G1 (BLOCKING) — `grading_standard_status.provided` must be true. If false, set the top-level `status_message` field to:
 "❌ GRADING STANDARD MISSING / 缺少评分标准 — Please upload the marking rubric or scoring standard and run the builder again. This knowledge base contains reference knowledge only and CANNOT be used for grading yet."
-If true, the first line of Part 1 must be:
+If true, set `status_message` to:
 "✅ Grading standard included — type: <standard_type>, scale: <levels or range>, source: <source>."
-Exception: if `grading_standard.scale.discrepancy_flag` is true, the first line of Part 1 must instead be:
+Exception: if `grading_standard.scale.discrepancy_flag` is true, set `status_message` instead to:
 "❌ GRADING SCALE CONFLICT / 评分量表冲突 — two different scoring scales were found across batches; please confirm the correct one and re-run the builder. This knowledge base CANNOT be used for grading yet."
 CHECK G2 — `grading_standard.scale` must define a type plus either a levels list or a min/max range.
 CHECK G3 — For rubric_matrix or grade_bands standards: every dimension must have a verbatim descriptor for EVERY level of the scale. List any missing dimension/level pairs. Skip this check for any grade_bands component defined only by numeric grade_boundaries with no written descriptors — that is not an incompleteness.
@@ -44,5 +44,10 @@ Note: CHECKs 1, 2, 3, 4 and 5 only apply when the assignment actually contains t
 
 ## Output Format
 
-Part 1: Markdown summary. It MUST begin with the Grading Standard Status line from CHECK G1, followed by the remaining completeness check results and warnings.
-Part 2: Complete merged JSON in a code block.
+Output ONLY the complete merged knowledge base as a SINGLE valid JSON document — no markdown, no "Part 1 / Part 2", no status summary outside the JSON, NO code fences (no ```), and no commentary before or after. This exact output is stored as the knowledge base and re-read as the `existing_knowledge_base` input on the next batch, so it MUST be pure, parseable JSON — anything else breaks multi-batch merging and downstream grading.
+
+Carry all check results INSIDE the JSON so nothing is lost — add these two top-level fields to the merged object:
+- `"status_message"`: the single status line decided by CHECK G1 (the ✅ / ❌ line).
+- `"warnings"`: an array of every warning produced by the Automatic Completeness Checks above (use `[]` if there are none).
+
+Keep `grading_standard_status.provided` and `action_required` accurate — those are the authoritative flags the grader and the next merge step read.
