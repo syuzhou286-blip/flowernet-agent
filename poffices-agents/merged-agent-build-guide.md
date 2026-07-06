@@ -93,24 +93,26 @@ Context Key 先全部写死 `teacher_1`，跑通后再换成平台登录用户ID
 
 ## 4. 意图分类 Prompt（放进 Input Analysis(7) 的 Prompt 框）
 
+⚠️ 必须写完整的判断指令，不能只写 `'User_Query': {query}` —— 那样模型不知道要输出
+`update_kb`/`grade`，If 就分流不了。按其它卡的 `[Instructions] ... --- ## Input` 格式：
+
 ```
-你是一个意图路由器。读取老师的请求，只输出一个词，不要输出任何其它内容。
-
-老师的请求：
-{query}
-
-判断：
-- 老师想【建立或更新知识库】（上传了评分标准/评分细则/答案/参考资料，或说“建库”“更新知识库”“上传评分标准”“build/update knowledge base”）→ 输出：update_kb
-- 老师想【批改学生作业】（上传了学生作业/作文/答卷，或说“批改”“打分”“评一下”“grade this”）→ 输出：grade
+[Instructions]
+你是一个意图路由器。读取下面 `User_Query` 里老师的请求，只输出一个词，不要输出任何其它内容：
+- 老师想【建立或更新知识库】（上传了评分标准/评分细则/答案/参考资料，或说“建库”“更新知识库”“上传评分标准”“update/build knowledge base”）→ 输出：update_kb
+- 老师想【批改学生作业】（上传了学生作业/作文/答卷，或说“批改”“打分”“评一下”“grade”）→ 输出：grade
 - 分不清时 → 输出：grade
 
 只允许输出下面之一（全小写，无引号、无标点、无解释）：
 update_kb
 grade
+---
+## Input
+'User_Query': {query}
 ```
 
 > 若老师常常只上传文件、不打字，query 太薄会判不准。想更稳，可把 Input Analysis
-> 移到两张 Metadata 之后，并在 prompt 里多喂一句 `{layer_name_read-md_output}` 的开头
+> 移到两张 Metadata 之后，并在 `## Input` 里多喂一句 `{layer_name_read-md_output}` 的开头
 > 让它也参考文件内容再判。先做 demo 的话，让老师在 query 里说清楚要干嘛即可。
 
 ---
