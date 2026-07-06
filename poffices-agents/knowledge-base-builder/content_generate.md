@@ -21,7 +21,7 @@ Produce a complete, self-contained JSON. Do not produce a summary or narrative.
 - Rule 7: This may be one batch of a multi-batch extraction. Extract what is present. Missing sections will be filled by later batches.
 - Rule 8: Be exhaustive. Always prefer listing every data point over summarising.
 - Rule 9: Treat the grading standard as first-class data. Copy score level descriptors, point values, band definitions, and marking criteria VERBATIM (word for word, in the original language) — do not paraphrase, compress, or re-scale them. The downstream grading agent must apply the teacher's exact standard, not your interpretation of it.
-- Rule 10: NEVER invent or convert a scoring scale. If the materials grade with letters A–E, extract A–E. If they use bands such as Distinction/Merit/Pass or 优/良/合格/不合格, extract those exact labels in order. If they award marks per question, extract the marks per question. Do not translate any scale into points out of 5, percentages, or any other system the teacher did not define.
+- Rule 10: NEVER invent or convert a scoring scale. If the materials grade with letters A–E, extract A–E. If they use bands such as Distinction/Merit/Pass (or bands written in another language), extract those exact labels in order and in their original language. If they award marks per question, extract the marks per question. Do not translate any scale into points out of 5, percentages, or any other system the teacher did not define.
 
 ## Task 1 — Extract Ground Truth (from primary source materials)
 
@@ -96,19 +96,19 @@ Locate every document, table, or section that defines how this assignment is sco
 Classify `standard_type` as one of (or a comma-separated combination for hybrids):
 - "rubric_matrix" — scoring dimensions crossed with score levels, each cell has a descriptor
 - "points_per_item" — marks allocated per question or per step (typical for maths, calculations, short-answer quizzes)
-- "grade_bands" — holistic letter grades or level bands (e.g. A–E, Distinction/Merit/Pass, 优/良/合格) with descriptors for each band
+- "grade_bands" — holistic letter grades or level bands (e.g. A–E, Distinction/Merit/Pass, or bands written in another language) with descriptors for each band
 - "checklist" — pass/fail or present/absent criteria
 - "holistic" — a single overall judgement guided by narrative descriptors
 If it combines several genuinely distinct scoring methods (e.g. per-question marks PLUS a separately written rubric), record every component and use "hybrid: <component types>".
 EXCEPTION — per-question marks whose TOTAL is merely mapped to letter or band cutoffs (e.g. A ≥ 27, B ≥ 21, C ≥ 15) is NOT a hybrid: classify it as "points_per_item" and record the cutoffs in `aggregation.grade_boundaries` and the letters in `aggregation.overall_labels`. Use a grade_bands component only when the standard actually writes descriptors for the bands.
-TIE-BREAK — if band labels (letters, Distinction/Merit/Pass, 优/良/合格) are applied per dimension, i.e. there is a descriptor for each dimension × band cell, classify as "rubric_matrix" and record the band labels as `scale.levels` (with `scale.type` "letter" or "band_label"). Use "grade_bands" ONLY for a standard with no dimensions: one single set of band descriptors judging the whole work.
+TIE-BREAK — if band labels (letters, Distinction/Merit/Pass, or labels in another language) are applied per dimension, i.e. there is a descriptor for each dimension × band cell, classify as "rubric_matrix" and record the band labels as `scale.levels` (with `scale.type` "letter" or "band_label"). Use "grade_bands" ONLY for a standard with no dimensions: one single set of band descriptors judging the whole work.
 
 ### 7.2 Scale
-Record the exact scale in `scale`: the `type` ("numeric", "letter", "band_label", "percentage", "pass_fail"), the complete ORDERED list of `levels` from lowest to highest (e.g. [1,2,3,4,5,6] or ["E","D","C","B","A"] or ["不合格","合格","良","优"]), `min` and `max` where numeric, and the `pass_threshold` if one is stated.
+Record the exact scale in `scale`: the `type` ("numeric", "letter", "band_label", "percentage", "pass_fail"), the complete ORDERED list of `levels` from lowest to highest (e.g. [1,2,3,4,5,6] or ["E","D","C","B","A"] or ["Fail","Pass","Merit","Distinction"] — keep the labels in their original language), `min` and `max` where numeric, and the `pass_threshold` if one is stated.
 
 ### 7.3 Dimensions (for rubric_matrix; grade_bands uses a single "Overall" dimension)
 For EVERY scoring dimension, domain, or criterion: the exact name as written, its weight or maximum score, and the VERBATIM descriptor for EVERY level of the scale — including all middle levels. Extract all sub-dimensions. For grade_bands standards, create one dimension named "Overall" holding every band descriptor. If a band has only a numeric cutoff and no written descriptor, do NOT invent a descriptor for it — the cutoff belongs in `aggregation.grade_boundaries`.
-Copy each level descriptor CHARACTER-FOR-CHARACTER. Do NOT compress a multi-clause descriptor into a single sentence, and do NOT drop its concrete markers — counts (e.g. "2 处以内"), thresholds, examples, or the point range for that level. These markers are what the grading agent uses to tell one band from the next; losing them makes the standard unusable. Extract the point range or max score per dimension AND per level whenever the rubric states one (e.g. "内容 17–20 分为优秀"); leave `max_score` blank only if the rubric truly gives no numbers.
+Copy each level descriptor CHARACTER-FOR-CHARACTER, in its original language. Do NOT compress a multi-clause descriptor into a single sentence, and do NOT drop its concrete markers — counts (e.g. "at most 2 errors"), thresholds, examples, or the point range for that level. These markers are what the grading agent uses to tell one band from the next; losing them makes the standard unusable. Extract the point range or max score per dimension AND per level whenever the rubric states one (e.g. "Content: 17–20 = top band"); leave `max_score` blank only if the rubric truly gives no numbers.
 
 ### 7.4 Item-level marking scheme (for points_per_item)
 For EVERY question or task item: `item_id` (question number), the question text or task, `max_marks`, each individual marking point with the marks it carries (e.g. "correct method: 2 marks", "correct final answer with units: 1 mark"), partial credit rules, the correct answer or all acceptable answers, and any listed common wrong answers with the marks they receive. Every question in the assignment must appear here — do not stop after the first few.
@@ -117,7 +117,7 @@ For EVERY question or task item: `item_id` (question number), the question text 
 How the final result is computed: `method` (sum, weighted average, lowest dimension, holistic judgement, etc.), `total_possible`, `grade_boundaries` or band cut-offs (e.g. "A: ≥ 90%", "Pass: ≥ 40/60") as an ordered list, `rounding_rules`, and the `overall_labels` used for the final result if they differ from the per-dimension scale.
 
 ### 7.6 Deductions and special rules
-All penalties (lateness, missing units, wrong significant figures, exceeding or falling short of word limits), bonus rules, automatic-zero conditions, and any gating rules such as "must pass dimension X to pass overall" or "偏题不予通过". Extract quantified penalty rules EXACTLY, keeping the numbers (e.g. "字数每少 50 字扣 1 分，最多扣 3 分") — never generalize a quantified rule down to "扣减相应分数" / "deduct accordingly".
+All penalties (lateness, missing units, wrong significant figures, exceeding or falling short of word limits), bonus rules, automatic-zero conditions, and any gating rules such as "must pass dimension X to pass overall" or "off-topic work cannot pass". Extract quantified penalty rules EXACTLY, keeping the numbers (e.g. "deduct 1 mark for every 50 words below the minimum, up to 3 marks") — never generalize a quantified rule down to "deduct accordingly".
 
 ### 7.7 Verbatim excerpts
 Quote, exactly as written, the 3-5 sentences of the grading standard that are most decisive for scoring (e.g. the definition of the top band, the pass condition, a strict penalty rule).

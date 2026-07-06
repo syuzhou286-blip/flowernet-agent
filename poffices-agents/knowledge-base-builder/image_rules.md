@@ -24,11 +24,11 @@ First-batch handling: if the existing knowledge base input is empty, missing, or
 After merging, run these checks and add warnings to a "warnings" array if any fail:
 
 CHECK G1 (BLOCKING) — `grading_standard_status.provided` must be true. If false, set the top-level `status_message` field to:
-"❌ GRADING STANDARD MISSING / 缺少评分标准 — Please upload the marking rubric or scoring standard and run the builder again. This knowledge base contains reference knowledge only and CANNOT be used for grading yet."
+"GRADING STANDARD MISSING — Please upload the marking rubric or scoring standard and run the builder again. This knowledge base contains reference knowledge only and CANNOT be used for grading yet."
 If true, set `status_message` to:
-"✅ Grading standard included — type: <standard_type>, scale: <levels or range>, source: <source>."
+"Grading standard included — type: <standard_type>, scale: <levels or range>, source: <source>."
 Exception: if `grading_standard.scale.discrepancy_flag` is true, set `status_message` instead to:
-"❌ GRADING SCALE CONFLICT / 评分量表冲突 — two different scoring scales were found across batches; please confirm the correct one and re-run the builder. This knowledge base CANNOT be used for grading yet."
+"GRADING SCALE CONFLICT — two different scoring scales were found across batches; please confirm the correct one and re-run the builder. This knowledge base CANNOT be used for grading yet."
 CHECK G2 — `grading_standard.scale` must define a type plus either a levels list or a min/max range.
 CHECK G3 — For rubric_matrix or grade_bands standards: every dimension must have a verbatim descriptor for EVERY level of the scale. List any missing dimension/level pairs. Skip this check for any grade_bands component defined only by numeric grade_boundaries with no written descriptors — that is not an incompleteness.
 CHECK G4 — For points_per_item standards: `item_level_marking` must contain every question, and per-item max_marks should sum to `aggregation.total_possible` when both are stated. Warn on any mismatch or gap.

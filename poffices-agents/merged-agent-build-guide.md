@@ -5,13 +5,19 @@ Context Key 先全部写死 `teacher_1`，跑通后再换成平台登录用户ID
 
 ---
 
-## 0. 本次必须修的 3 个点
+## 0. 本次必须修的点
 
 1. **Input Analysis 的 Instance Name 从 `input` 改成 `intent`** —— 否则 If 里的
    `{layer_name_intent_output}` 取不到值。
-2. **If 条件匹配 `update` 不是 `upload`**：`!{layer_name_intent_output}.includes("update")`
-3. **合并卡输出改成纯 JSON**（已在 `reference_rules` 里改好），并且
+2. **Input Analysis 的 Prompt 必须是完整分类指令**（第 4 节），不能只写 `'User_Query': {query}`。
+3. **If 条件匹配 `update` 不是 `upload`**：`!{layer_name_intent_output}.includes("update")`
+4. **合并卡输出改成纯 JSON**（已在 `reference_rules` 里改好），并且
    **Text Merge(13) 回执引用 `{layer_name_combine_kb_output}`**（不是 `{layer_name_gen-docx1_output}`）。
+5. **三张储物格卡的 Context Key 必须完全一致** —— Read(6)、Read(2)、Write(3) 全部用
+   **纯文本 `teacher_1`（不要花括号 `{}`）**。`{teacher_1}` 是"变量 teacher_1 的值"（你没定义→解析成空），
+   和纯文本 `teacher_1` 是不同的储物格钥匙。若 Write 用 `{teacher_1}` 而 Read(6) 用 `teacher_1`，
+   建好的库会存到别的格子里，打分时读不到 → 误以为建库失败。多老师时再统一换成 `{user_id}`，
+   但三处必须一模一样。
 
 ---
 
@@ -94,16 +100,16 @@ Context Key 先全部写死 `teacher_1`，跑通后再换成平台登录用户ID
 ## 4. 意图分类 Prompt（放进 Input Analysis(7) 的 Prompt 框）
 
 ⚠️ 必须写完整的判断指令，不能只写 `'User_Query': {query}` —— 那样模型不知道要输出
-`update_kb`/`grade`，If 就分流不了。按其它卡的 `[Instructions] ... --- ## Input` 格式：
+`update_kb`/`grade`，If 就分流不了。指令全部用英文，按其它卡的 `[Instructions] ... --- ## Input` 格式：
 
 ```
 [Instructions]
-你是一个意图路由器。读取下面 `User_Query` 里老师的请求，只输出一个词，不要输出任何其它内容：
-- 老师想【建立或更新知识库】（上传了评分标准/评分细则/答案/参考资料，或说“建库”“更新知识库”“上传评分标准”“update/build knowledge base”）→ 输出：update_kb
-- 老师想【批改学生作业】（上传了学生作业/作文/答卷，或说“批改”“打分”“评一下”“grade”）→ 输出：grade
-- 分不清时 → 输出：grade
+You are an intent router. Read the teacher's request in `User_Query` below and output exactly ONE word, nothing else:
+- If the teacher wants to BUILD or UPDATE the knowledge base (they uploaded a grading rubric / marking scheme / answer key / reference materials, or the request says things like "build the knowledge base", "update the knowledge base", "upload the grading standard") → output: update_kb
+- If the teacher wants to GRADE a student submission (they uploaded a student's worksheet / essay / answers, or the request says things like "grade this", "mark this", "score this worksheet") → output: grade
+- If it is unclear → output: grade
 
-只允许输出下面之一（全小写，无引号、无标点、无解释）：
+Output ONLY one of the following, lowercase, with no quotes, no punctuation, and no explanation:
 update_kb
 grade
 ---
