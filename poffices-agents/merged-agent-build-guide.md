@@ -27,7 +27,7 @@ Context Key 先全部写死 `teacher_1`，跑通后再换成平台登录用户ID
 ## 1. 整条链（你已搭的拓扑）
 
 ```
-[Input Analysis (7)]  改名 intent，读 {query}，输出 grade / update_kb
+[Text Generation: intent]  读 {query}，输出纯文本 grade / update_kb（勿用 Input Analysis 卡）
         ▼
 [Metadata Extraction (10)]  解析上传文件（沿用旧 agent）
         ▼
@@ -68,7 +68,7 @@ Context Key 先全部写死 `teacher_1`，跑通后再换成平台登录用户ID
 
 | 卡片 | 关键设置 | 输出 token | 下游 |
 |---|---|---|---|
-| **Input Analysis (7)** | Instance=`intent`；Prompt=意图分类（第 4 节）；读 `{query}` | `{layer_name_intent_output}` = grade/update_kb | Metadata(10) |
+| **意图分类卡（必须用 Text Generation，不要用 Input Analysis）** | Instance=`intent`；Prompt=意图分类（第 4 节）；读 `{query}`。⚠️ Input Analysis 卡输出的是结构化数组（实测输出 `[]`），If 取不到 `update_kb`；必须换成 Text Generation 卡才输出纯文本 | `{layer_name_intent_output}` = grade/update_kb | Metadata(10) |
 | **Metadata Extraction (10)** | 沿用旧 agent 原样 | 内部 | Metadata(11) |
 | **Metadata Extraction (11) read-md** | 沿用旧 agent 原样 | `{layer_name_read-md_output}` = 上传文件的文本 | If(1) |
 | **If-Then-Else (1)** | 条件 `!{layer_name_intent_output}.includes("update")` | — | then→Read(6)；else→Read(2) |
@@ -82,7 +82,7 @@ Context Key 先全部写死 `teacher_1`，跑通后再换成平台登录用户ID
 
 > 变量槽分配（三个 prompt 互不同名，`image_rules` 留作 KB 储物格）：
 > `agent_content_generate`=建库提取 · `reference_rules`=建库合并 · `agent_knowledge`=批改。
-> Input Analysis 的意图 prompt 直接写在卡里，不占变量槽。
+> 意图分类 prompt 直接写在那张 Text Generation 卡里，不占变量槽。
 
 ---
 
