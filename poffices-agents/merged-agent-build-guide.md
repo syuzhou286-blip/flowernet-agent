@@ -175,6 +175,11 @@ Update 分支根本没跑，所以什么都没写进抽屉，KB 一直空。grad
 1. 确认这次**真的附上了文件**（只打字、没传文件 → metadata 解析为空 → 空 KB）。
 2. 看运行记录里 **read-md（Metadata Extraction）** 那步的 Result：
    - Result 为空 → 文件没被解析（文件上传 / `{file_urls}`、`{file_db_idx}` 这一环的问题）。
-   - Result 有文件文字 → extract_kb 没读到它：检查 extract_kb 里 `main_paper_text` 引用的
-     `{layer_name_read-md_output}` token 名是否和 read-md 卡的真实输出 token 完全一致。
+   - Result 有文件文字 → extract_kb 没读到它：**卡名和 token 对不上**（最常见）。
 3. 即使内容进来了，`provided` 仍为 false 说明上传的文件里没有评分标准 —— 需要传含 rubric 的文件。
+
+**实测案例（Copy 版）**：解析卡的 instance 名是 `custom-1`（输出 `{layer_name_custom-1_output}`），
+但提取 prompt 里找的是 `{layer_name_read-md_output}` → 读到空 → KB 全空、报 MISSING。
+现象是 Step 3（解析）Result 明明有文件全文，Step 4（LLM）却是空的。
+**修法**：把解析卡改名为 `read-md`（一处搞定），或把 prompt 里所有 `{layer_name_read-md_output}`
+改成解析卡真实的输出 token。规则同 intent：**卡的 instance 名 ↔ prompt 引用的 `{layer_name_X_output}` 必须完全一致。**
