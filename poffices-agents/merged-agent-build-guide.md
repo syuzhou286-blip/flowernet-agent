@@ -183,3 +183,9 @@ Update 分支根本没跑，所以什么都没写进抽屉，KB 一直空。grad
 现象是 Step 3（解析）Result 明明有文件全文，Step 4（LLM）却是空的。
 **修法**：把解析卡改名为 `read-md`（一处搞定），或把 prompt 里所有 `{layer_name_read-md_output}`
 改成解析卡真实的输出 token。规则同 intent：**卡的 instance 名 ↔ prompt 引用的 `{layer_name_X_output}` 必须完全一致。**
+
+**实测案例（JSON 字段没变成变量）**：想让某张卡输出 JSON、再让下游用它的某个字段（如 AOA 引用
+`{keyword_list}`）。把输出 JSON 的分析 prompt 放进**普通 Text Generation 卡**时，那份 JSON 只是
+**纯文本**（只在 `{layer_name_X_output}` 里），其字段**不会**变成变量 → 下游 `{keyword_list}` 恒空。
+**修法**：把分析 prompt 放进能把 JSON 输出**解析成命名变量**的卡（**Input Analysis**，或带 schema 的卡）。
+规律：**要纯文本输出 → Text Generation；要把输出的字段当变量用 → 用能解析 JSON 的卡（Input Analysis）。**
