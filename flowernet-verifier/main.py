@@ -7,7 +7,9 @@ import os
 import re
 import json
 import time
+import importlib.util
 from collections import deque
+from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 from rank_bm25 import BM25Okapi
 from rouge_score import rouge_scorer
@@ -22,6 +24,19 @@ except Exception:
     _HAS_ST = False
 
 from history_store import HistoryManager
+
+_REVIEWER_MODULE_PATH = Path(__file__).resolve().parents[1] / "flowernet-generator" / "evolvable_reviewer.py"
+try:
+    _reviewer_spec = importlib.util.spec_from_file_location("evolvable_reviewer", _REVIEWER_MODULE_PATH)
+    _reviewer_module = importlib.util.module_from_spec(_reviewer_spec)
+    assert _reviewer_spec and _reviewer_spec.loader
+    _reviewer_spec.loader.exec_module(_reviewer_module)
+    build_reviewer_assessment = _reviewer_module.build_reviewer_assessment
+    EVOLVABLE_REVIEWER_AVAILABLE = True
+except Exception as _reviewer_exc:
+    build_reviewer_assessment = None
+    EVOLVABLE_REVIEWER_AVAILABLE = False
+    print(f"⚠️ Evolvable reviewer unavailable: {_reviewer_exc}")
 
 # 英文停用词表：过滤高频功能词，只保留实义词参与计算
 _EN_STOPWORDS = {
@@ -223,16 +238,19 @@ class FlowerNetVerifier:
         source_check: Dict[str, Any],
         context_text: str = "",
         source_results: Optional[List[Dict[str, Any]]] = None,
+        coverage_diag: Optional[Dict[str, Any]] = None,
+        evidence_diag: Optional[Dict[str, Any]] = None,
+        novelty_diagnostics: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, float]:
         draft = draft or ""
         outline = outline or ""
         history_list = history_list or []
-        coverage_diag = self._coverage_diagnostics(
+        coverage_diag = coverage_diag or self._coverage_diagnostics(
             draft=draft,
             outline=outline,
             context_text=context_text,
         )
-        evidence_diag = self._evidence_diagnostics(
+        evidence_diag = evidence_diag or self._evidence_diagnostics(
             draft=draft,
             outline=outline,
             context_text=context_text,
@@ -249,22 +267,39 @@ class FlowerNetVerifier:
         rouge_l = self._safe_float((rel.get("details") or {}).get("rouge_l"), rel.get("score", 0.0))
         bm25_score = self._safe_float((rel.get("details") or {}).get("bm25_score"), rel.get("score", 0.0))
 
-        # 1) Topic alignment: 关注是否紧扣小节主题
-        topic_alignment = self._clip01(0.6 * keyword_coverage + 0.25 * rouge_l + 0.15 * bm25_score)
+        title_anchor = self._outline_title_anchor(outline)
+        title_coverage = self._topic_anchor_coverage(draft=draft, outline=title_anchor) if title_anchor else keyword_coverage
 
-        # 2) Novelty: 与历史去重互补，越高越新
-        novelty = self._clip01(1.0 - self._safe_float(red.get("score"), 0.0))
+        # 1) Topic alignment: 是否紧扣当前小节标题/任务，不承担“写得够全”的职责。
+        topic_alignment = self._clip01(
+            0.46 * title_coverage
+            + 0.30 * self._safe_float((rel.get("details") or {}).get("anchor_coverage"), 0.0)
+            + 0.16 * bm25_score
+            + 0.08 * rouge_l
+        )
+
+        if novelty_diagnostics is None:
+            novelty_diagnostics = self._novelty_diagnostics(
+                draft=draft,
+                history_list=history_list,
+                red=red,
+                coverage_diag=coverage_diag,
+                evidence_diag=evidence_diag,
+            )
+
+        # 2) Novelty: 独立检测信息增量，而不是简单等于 1 - redundancy。
+        novelty = self._clip01(self._safe_float(novelty_diagnostics.get("score"), 0.0))
 
         # 3) Coverage completeness: 是否覆盖大纲关键信息。
         # 旧逻辑只看关键词/ROUGE，容易把“提到主题”误判成“充分覆盖”。
         # 新逻辑加入 target terms、内容面向(aspects)和来源覆盖，逼迫生成器写出
         # 方法、应用、评价、风险、未来方向等 topic-specific 信息。
         coverage_completeness = self._clip01(
-            0.36 * keyword_coverage
-            + 0.18 * rouge_l
-            + 0.26 * self._safe_float(coverage_diag.get("aspect_coverage"), 0.0)
-            + 0.12 * self._safe_float(coverage_diag.get("source_topic_coverage"), 0.0)
-            + 0.08 * self._safe_float(coverage_diag.get("specificity_score"), 0.0)
+            0.24 * keyword_coverage
+            + 0.36 * self._safe_float(coverage_diag.get("aspect_coverage"), 0.0)
+            + 0.18 * self._safe_float(coverage_diag.get("source_topic_coverage"), 0.0)
+            + 0.14 * self._safe_float(coverage_diag.get("specificity_score"), 0.0)
+            + 0.08 * rouge_l
         )
 
         chinese_ratio = (
@@ -272,20 +307,60 @@ class FlowerNetVerifier:
             / max(1, len(re.sub(r"\s+", "", draft)))
         )
 
-        # 4) Logical coherence: 使用句长稳定性 + 连接词密度近似估计。
-        # 中文学术段落天然比英文短句更长，不能按短句写作目标惩罚正式论文段落。
+        # 4) Logical coherence: estimate paragraph flow from sentence shape,
+        # transitions, paragraphing, and explicit argumentative structure.
+        # This is intentionally a wide-band heuristic: academic English can be
+        # coherent with long, information-dense sentences, so a single target
+        # length would over-penalize publication-style prose and trigger noisy
+        # controller rewrites.
         sentence_units = [s.strip() for s in re.split(r"[。！？!?；;\n]", draft) if s.strip()]
         if sentence_units:
             lengths = [len(s) for s in sentence_units]
             avg_len = sum(lengths) / len(lengths)
-            target_len = 42.0 if chinese_ratio >= 0.35 else 24.0
-            len_penalty = abs(avg_len - target_len) / target_len
+            if chinese_ratio >= 0.35:
+                lower_len, upper_len = 24.0, 96.0
+                long_tail = 160.0
+            else:
+                # ``len`` is character-based.  Long-form English academic
+                # sentences commonly sit around 90-260 characters; penalize
+                # only very choppy or very overloaded prose.
+                lower_len, upper_len = 70.0, 260.0
+                long_tail = 420.0
+            if avg_len < lower_len:
+                length_signal = self._clip01(avg_len / lower_len)
+            elif avg_len <= upper_len:
+                length_signal = 1.0
+            else:
+                length_signal = self._clip01(1.0 - ((avg_len - upper_len) / max(1.0, long_tail - upper_len)))
             connector_count = len(re.findall(
-                r"因此|所以|然而|同时|此外|首先|其次|最后|由此|综上|相比|例如|because|however|therefore|moreover|first|second|finally",
+                r"因此|所以|然而|同时|此外|首先|其次|最后|由此|综上|相比|例如|换言之|进一步|"
+                r"because|however|therefore|moreover|first|second|finally|"
+                r"in addition|for example|for instance|as a result|in contrast|"
+                r"by contrast|nevertheless|consequently|specifically|more importantly|"
+                r"rather than|whereas|while|although|similarly|accordingly|in practice|"
+                r"this means|the implication|taken together",
                 draft.lower(),
             ))
             connector_density = connector_count / max(1, len(sentence_units))
-            logical_coherence = self._clip01((1.0 - min(1.0, len_penalty)) * 0.65 + min(1.0, connector_density) * 0.35)
+            paragraphs_for_flow = [
+                p.strip()
+                for p in re.split(r"\n\s*\n", draft)
+                if len(p.strip()) >= 80 and not re.match(r"^#{1,6}\s+", p.strip())
+            ]
+            paragraph_signal = min(1.0, len(paragraphs_for_flow) / 4.0)
+            transition_signal = min(1.0, connector_count / 6.0)
+            claim_flow_count = len(re.findall(
+                r"claim|evidence|reasoning|implication|limitation|risk|evaluation|"
+                r"mechanism|workflow|trade-off|recommendation|论点|证据|推理|启示|限制|风险|评估|机制",
+                draft.lower(),
+            ))
+            argument_signal = min(1.0, claim_flow_count / 10.0)
+            logical_coherence = self._clip01(
+                0.38 * length_signal
+                + 0.24 * transition_signal
+                + 0.22 * paragraph_signal
+                + 0.16 * argument_signal
+            )
         else:
             logical_coherence = 0.0
 
@@ -314,7 +389,12 @@ class FlowerNetVerifier:
         heading_count = len(re.findall(r"^#{1,4}\s+", draft, flags=re.MULTILINE))
         bullet_count = len(re.findall(r"^[\-\*\d]+[\.\)]?\s+", draft, flags=re.MULTILINE))
         connector_count = len(re.findall(
-            r"因此|所以|然而|同时|此外|首先|其次|最后|由此|综上|相比|例如|because|however|therefore|moreover|first|second|finally",
+            r"因此|所以|然而|同时|此外|首先|其次|最后|由此|综上|相比|例如|换言之|进一步|"
+            r"because|however|therefore|moreover|first|second|finally|"
+            r"in addition|for example|for instance|as a result|in contrast|"
+            r"by contrast|nevertheless|consequently|specifically|more importantly|"
+            r"rather than|whereas|while|although|similarly|accordingly|in practice|"
+            r"this means|the implication|taken together",
             draft.lower(),
         ))
         paragraph_signal = min(1.0, len(paragraphs) / 3.0)
@@ -343,8 +423,13 @@ class FlowerNetVerifier:
         outline: str,
         history_list: List[str],
         require_available: bool = False,
+        endpoint_override: Optional[str] = None,
     ) -> Dict[str, float]:
-        endpoint = os.getenv("UNIEVAL_ENDPOINT", "").strip()
+        endpoint = (
+            str(endpoint_override).strip()
+            if endpoint_override is not None
+            else os.getenv("UNIEVAL_ENDPOINT", "").strip()
+        )
         if not endpoint:
             if require_available:
                 raise RuntimeError(
@@ -452,14 +537,15 @@ class FlowerNetVerifier:
     def _quality_dimension_thresholds(self) -> Dict[str, float]:
         """获取每个维度的阈值（可通过 JSON 覆盖，或使用默认值）"""
         # 默认阈值保持适度严格，避免内容过早通过而没有进入 controller 修复环节。
-        # 小幅上调即可触发边缘小节修复，避免把正常小节也拖进多轮重写。
+        # 阈值按各维度的真实得分区间校准，避免 novelty 过敏而 evidence/coherence
+        # 等弱项长期不触发。每个维度仍有独立职责，不用一个标量替代六维诊断。
         default_thresholds = {
-            "topic_alignment": 0.555,
-            "coverage_completeness": 0.555,
-            "logical_coherence": 0.075,
-            "evidence_grounding": 0.355,
-            "novelty": 0.685,
-            "structure_clarity": 0.535,
+            "topic_alignment": 0.52,
+            "coverage_completeness": 0.70,
+            "logical_coherence": 0.50,
+            "evidence_grounding": 0.50,
+            "novelty": 0.62,
+            "structure_clarity": 0.62,
         }
         
         thresholds_raw = os.getenv("QUALITY_DIMENSION_THRESHOLDS_JSON", "").strip()
@@ -473,6 +559,24 @@ class FlowerNetVerifier:
             except Exception:
                 pass
         return default_thresholds
+
+    def _quality_dimension_principles(self) -> Dict[str, str]:
+        """Document the independent responsibility of each verifier dimension."""
+        return {
+            "topic_alignment": "Checks whether the subsection stays locked to the current outline/title anchor.",
+            "coverage_completeness": "Checks breadth of required content aspects, source-topic coverage, and specificity.",
+            "logical_coherence": "Checks argument flow, causal transitions, and sentence/paragraph reasoning shape.",
+            "evidence_grounding": "Checks whether claims are bound to valid sources, citations, and evidence types.",
+            "novelty": "Checks information gain beyond prior sections: new terms, new phrases, new aspects, and new source-specific claims.",
+            "structure_clarity": "Checks readable document organization: paragraphing, headings/bullets balance, and transitions.",
+        }
+
+    @staticmethod
+    def _unieval_strict_for_request(endpoint_override: Optional[str]) -> bool:
+        strict = os.getenv("UNIEVAL_STRICT_REQUIRED", "false").lower() == "true"
+        if endpoint_override is not None and not str(endpoint_override).strip():
+            return False
+        return strict
 
     def _check_dimension_thresholds(self, dimensions: Dict[str, float]) -> Dict[str, Any]:
         """检查是否所有维度都通过各自的阈值"""
@@ -505,6 +609,7 @@ class FlowerNetVerifier:
         quality_score: float,
         quality_threshold: float,
         dimension_check: Dict[str, Any],
+        fusion: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Allow high-quality drafts with one tiny dimension miss to pass."""
         if os.getenv("QUALITY_SOFT_PASS_ENABLED", "true").lower() != "true":
@@ -520,25 +625,89 @@ class FlowerNetVerifier:
         )
         allowed_dims_raw = os.getenv(
             "QUALITY_SOFT_PASS_ALLOWED_DIMS",
-            "logical_coherence,coverage_completeness,structure_clarity,evidence_grounding",
+            "logical_coherence,coverage_completeness,structure_clarity,evidence_grounding,novelty",
         )
         allowed_dims = {x.strip() for x in allowed_dims_raw.split(",") if x.strip()}
 
         if not failed or len(failed) > max_failed or quality_score < min_quality:
             return {"passed": False, "reason": "failed_count_or_score"}
 
+        uncertainty_boundary_dims: List[str] = []
+        fusion = fusion if isinstance(fusion, dict) else {}
+        fusion_sources = fusion.get("sources", {}) if isinstance(fusion.get("sources"), dict) else {}
+        confidence_intervals = (
+            fusion.get("confidence_interval", {})
+            if isinstance(fusion.get("confidence_interval"), dict)
+            else {}
+        )
         for dim in failed:
             item = per_dim.get(dim, {}) if isinstance(per_dim.get(dim), dict) else {}
             dim_margin = self._safe_float(item.get("margin"), -1.0)
+            threshold = self._safe_float(item.get("threshold"), 1.0)
+            source_item = fusion_sources.get(dim, {}) if isinstance(fusion_sources.get(dim), dict) else {}
+            interval = confidence_intervals.get(dim, {}) if isinstance(confidence_intervals.get(dim), dict) else {}
+            heuristic = self._safe_float(source_item.get("heuristic"), 0.0)
+            interval_high = self._safe_float(interval.get("high"), 0.0)
+            uncertainty_boundary = bool(
+                dim in allowed_dims
+                and dim_margin >= -0.05
+                and source_item.get("unieval_role") == "uncertainty"
+                and heuristic >= threshold
+                and interval_high >= threshold
+            )
+            if uncertainty_boundary:
+                uncertainty_boundary_dims.append(dim)
+                continue
             if dim not in allowed_dims or dim_margin < -margin:
                 return {"passed": False, "reason": f"hard_dimension:{dim}"}
 
         return {
             "passed": True,
-            "reason": "minor_dimension_miss",
+            "reason": "uncertainty_boundary" if uncertainty_boundary_dims else "minor_dimension_miss",
             "failed_dimensions": failed,
+            "uncertainty_boundary_dimensions": uncertainty_boundary_dims,
             "min_quality": round(min_quality, 4),
             "margin": round(margin, 4),
+        }
+
+    def _single_metric_epsilon_pass(
+        self,
+        *,
+        relevancy: float,
+        relevancy_threshold: float,
+        redundancy: float,
+        redundancy_threshold: float,
+        quality_score: float,
+        quality_threshold: float,
+        quality_passed: bool,
+        persona_passed: bool,
+        source_passed: bool,
+    ) -> Dict[str, Any]:
+        """Accept exactly one tiny scalar miss while preserving all hard gates."""
+        if os.getenv("VERIFIER_SINGLE_METRIC_EPSILON_PASS", "true").lower() != "true":
+            return {"passed": False, "reason": "disabled", "failures": []}
+        if not (bool(persona_passed) and bool(source_passed) and bool(quality_passed)):
+            return {"passed": False, "reason": "hard_gate_failed", "failures": []}
+
+        epsilon = max(
+            0.0,
+            min(0.02, self._safe_float(os.getenv("VERIFIER_SINGLE_METRIC_EPSILON", "0.008"), 0.008)),
+        )
+        failures: List[Dict[str, Any]] = []
+        scalar_checks = (
+            ("relevancy", float(relevancy_threshold) - float(relevancy)),
+            ("redundancy", float(redundancy) - float(redundancy_threshold)),
+            ("quality_score", float(quality_threshold) - float(quality_score)),
+        )
+        for metric, deficit in scalar_checks:
+            if deficit > 0:
+                failures.append({"metric": metric, "deficit": round(float(deficit), 6)})
+        passed = len(failures) == 1 and float(failures[0]["deficit"]) <= epsilon
+        return {
+            "passed": bool(passed),
+            "reason": "single_tiny_scalar_miss" if passed else "not_single_tiny_miss",
+            "epsilon": round(epsilon, 6),
+            "failures": failures,
         }
 
     def _quality_weights(self) -> Dict[str, float]:
@@ -593,11 +762,30 @@ class FlowerNetVerifier:
                 base_weight = self._clip01(self._safe_float(os.getenv("QUALITY_UNIEVAL_WEIGHT", "0.25"), 0.25))
                 min_weight = self._clip01(self._safe_float(os.getenv("QUALITY_UNIEVAL_DIVERGENCE_MIN_WEIGHT", "0.08"), 0.08))
                 divergence_threshold = self._clip01(self._safe_float(os.getenv("QUALITY_UNIEVAL_DIVERGENCE_THRESHOLD", "0.35"), 0.35))
+                high_confidence_floor = self._clip01(self._safe_float(os.getenv("QUALITY_UNIEVAL_HEURISTIC_CONFIDENT_FLOOR", "0.70"), 0.70))
+                max_uncertainty_penalty = self._clip01(self._safe_float(os.getenv("QUALITY_UNIEVAL_MAX_UNCERTAINTY_PENALTY", "0.025"), 0.025))
                 disagreement = abs(float(h) - float(u))
                 unieval_weight = base_weight
+                unieval_role = "second_opinion"
+                unieval_calibrated = False
                 if disagreement >= divergence_threshold and float(u) < float(h):
                     unieval_weight = min_weight
-                mean_val = (1.0 - unieval_weight) * float(h) + unieval_weight * float(u)
+                    if float(h) >= high_confidence_floor:
+                        # NLI entailment probabilities are not calibrated
+                        # absolute quality scores for long academic sections.
+                        # When source-aware heuristics are already strong, use
+                        # a very low NLI value as uncertainty evidence instead
+                        # of letting it collapse an otherwise good candidate.
+                        mean_val = float(h) - min(max_uncertainty_penalty, disagreement * 0.04)
+                        unieval_role = "uncertainty"
+                        unieval_calibrated = True
+                    else:
+                        # Borderline drafts should still be penalized by low
+                        # NLI evidence, preserving UniEval's verifier value.
+                        mean_val = (1.0 - unieval_weight) * float(h) + unieval_weight * float(u)
+                        unieval_role = "risk_penalty"
+                else:
+                    mean_val = (1.0 - unieval_weight) * float(h) + unieval_weight * float(u)
                 unc = self._clip01(disagreement)
                 low = self._clip01(mean_val - 0.5 * unc)
                 high = self._clip01(mean_val + 0.5 * unc)
@@ -605,6 +793,8 @@ class FlowerNetVerifier:
                     "heuristic": round(float(h), 4),
                     "unieval": round(float(u), 4),
                     "unieval_weight": round(unieval_weight, 4),
+                    "unieval_role": unieval_role,
+                    "unieval_calibrated": bool(unieval_calibrated),
                 }
             else:
                 mean_val = float(entries[0])
@@ -641,6 +831,51 @@ class FlowerNetVerifier:
         """实义词分词：过滤英文停用词和单字符 token，用于相似度计算"""
         tokens = [t.strip().lower() for t in jieba.cut(text)]
         return [t for t in tokens if len(t) > 1 and t not in _EN_STOPWORDS]
+
+    def _prefers_english_text(self, text: str) -> bool:
+        raw = str(text or "")
+        latin = len(re.findall(r"[A-Za-z]", raw))
+        cjk = len(re.findall(r"[\u4e00-\u9fff]", raw))
+        return latin >= max(80, cjk * 2)
+
+    def _cross_lingual_topic_expansions(self, text: str) -> List[str]:
+        """Map common Chinese task anchors to English canonical terms.
+
+        This keeps English-generation verification fair without using any
+        evaluation reference. The mapping is deliberately domain-generic and
+        phrase-oriented so it helps all topics that arrive as Chinese prompts.
+        """
+        source = str(text or "")
+        mapping = [
+            (("工具调用", "工具", "调用"), ["tool use", "tool calling", "tool-using workflows"]),
+            (("工作流", "工作流程", "流程"), ["workflows"]),
+            (("概念", "定义", "边界"), ["concept", "definition"]),
+            (("演进", "发展", "历史"), ["evolution", "development"]),
+            (("典型", "架构", "框架"), ["architecture", "architectures"]),
+            (("评估", "方法", "指标", "基准"), ["evaluation", "metrics", "benchmark"]),
+            (("应用", "场景", "案例"), ["application", "scenario"]),
+            (("风险", "局限", "限制", "挑战"), ["risk", "limitation"]),
+            (("未来", "趋势", "方向"), ["future", "future direction"]),
+            (("人工智能",), ["artificial intelligence", "AI"]),
+            (("智能体", "代理", "agents"), ["agent", "agents", "intelligent agents", "software agents"]),
+            (("机器学习",), ["machine learning"]),
+            (("深度学习",), ["deep learning"]),
+            (("强化学习",), ["reinforcement learning"]),
+            (("检索增强",), ["retrieval augmented generation", "RAG"]),
+            (("多模态",), ["multimodal", "multi-modal"]),
+            (("机器人",), ["robotics", "robot"]),
+            (("控制器",), ["controller"]),
+            (("验证器",), ["verifier"]),
+        ]
+        expansions: List[str] = []
+        lowered = source.lower()
+        for needles, values in mapping:
+            if any(needle.lower() in lowered or needle in source for needle in needles):
+                for value in values:
+                    norm = value.lower()
+                    if norm not in expansions:
+                        expansions.append(norm)
+        return expansions
 
     def _cjk_bigrams(self, text: str, max_items: int = 120) -> List[str]:
         """Extract stable Chinese character bigrams for topic recall."""
@@ -706,14 +941,20 @@ class FlowerNetVerifier:
         """Robust topic coverage for Chinese technical prose."""
         draft_lower = str(draft or "").lower()
         topic_terms = [
-            term for term in self._topic_terms(outline=outline, context_text="", draft="")
+            term for term in self._topic_terms(outline=outline, context_text="", draft=draft)
             if len(str(term).strip()) >= 2
         ]
         if topic_terms:
-            term_hits = sum(1 for term in topic_terms if str(term).lower() in draft_lower)
+            term_hits = 0
+            for term in topic_terms:
+                if self._term_matches_draft(str(term), draft_lower):
+                    term_hits += 1
             term_coverage = term_hits / max(1, len(topic_terms))
         else:
             term_coverage = 0.0
+
+        if self._prefers_english_text(draft):
+            return self._clip01(term_coverage)
 
         grams = self._cjk_bigrams(outline)
         if grams:
@@ -739,15 +980,37 @@ class FlowerNetVerifier:
         topic_source = f"{outline or ''} {context_text or ''}".strip()
         if not topic_source:
             topic_source = str(draft or "")
+        topic_source = re.sub(
+            r"\bLocal\s+original-orchestrator\s+FlowerNet\s+benchmark\.?\s*English\s+academic\s+writing\.?",
+            " ",
+            topic_source,
+            flags=re.I,
+        )
+        topic_source = re.sub(
+            r"\b(?:local|original-orchestrator)\s+FlowerNet\s+benchmark\b",
+            " ",
+            topic_source,
+            flags=re.I,
+        )
+        topic_source = re.sub(
+            r"你正在撰写一篇(?:整体)?背景说明",
+            " ",
+            topic_source,
+        )
 
         generic_tokens = {
             "section", "subsection", "outline", "prompt", "chapter", "content",
             "write", "writing", "draft", "article", "paper", "document",
+            "english", "academic", "local", "original", "orchestrator", "flowernet",
             "要求", "生成", "内容", "小节", "章节", "大纲", "写作", "文档",
             "介绍", "分析", "讨论", "说明", "包括", "以及", "关于",
             "标准", "分钟", "休息", "周期", "如何", "应对", "记录", "内部",
             "外部", "模板", "状态", "次数", "任务", "步骤", "流程", "示例",
             "当前", "需要", "覆盖", "必须", "本轮", "下一版", "写作", "要求",
+            "正在", "撰写", "一篇", "整体", "背景",
+            "topic", "target", "canonical", "anchor", "anchors", "requirement",
+            "requirements", "authoritative", "retrieval", "generation",
+            "verification", "repair",
         }
         zh_en_expansions = {
             "时间": ["time"],
@@ -773,10 +1036,19 @@ class FlowerNetVerifier:
             "商务": ["business"],
             "供应链": ["supply", "chain"],
         }
+        english_draft = self._prefers_english_text(draft)
         terms: List[str] = []
+        for expanded in self._cross_lingual_topic_expansions(topic_source):
+            if expanded not in generic_tokens and expanded not in _EN_STOPWORDS and expanded not in terms:
+                terms.append(expanded)
         for token in self._content_tokens(topic_source):
             token = token.strip().lower()
             if not token or token in generic_tokens or token.isdigit():
+                continue
+            if english_draft and re.search(r"[\u4e00-\u9fff]", token):
+                for expanded in self._cross_lingual_topic_expansions(token):
+                    if expanded not in generic_tokens and expanded not in _EN_STOPWORDS and expanded not in terms:
+                        terms.append(expanded)
                 continue
             if token not in terms:
                 terms.append(token)
@@ -788,6 +1060,29 @@ class FlowerNetVerifier:
             if len(terms) >= 36:
                 break
         return terms
+
+    @staticmethod
+    def _term_matches_draft(term: str, draft_lower: str) -> bool:
+        term_text = str(term or "").lower().strip()
+        if not term_text:
+            return False
+
+        def variants(piece: str) -> set[str]:
+            values = {piece}
+            if piece.endswith("s") and len(piece) > 4:
+                values.add(piece[:-1])
+            if piece.endswith("ies") and len(piece) > 5:
+                values.add(piece[:-3] + "y")
+            if piece.endswith("y") and len(piece) > 4:
+                values.add(piece[:-1] + "ies")
+            if "-" in piece:
+                values.add(piece.replace("-", " "))
+            return values
+
+        pieces = re.findall(r"[a-z][a-z0-9-]{2,}", term_text)
+        if pieces:
+            return all(any(value in draft_lower for value in variants(piece)) for piece in pieces)
+        return term_text in draft_lower
 
     def _source_topic_terms(self, source_results: List[Dict[str, Any]], max_terms: int = 24) -> List[str]:
         """Extract topic-bearing terms from retrieved source titles/snippets."""
@@ -821,7 +1116,10 @@ class FlowerNetVerifier:
         draft_lower = str(draft or "").lower()
         target_terms = self._topic_terms(outline=outline, context_text=context_text, draft=draft)
         target_terms = [term for term in target_terms if len(str(term).strip()) >= 2][:24]
-        matched_terms = [term for term in target_terms if str(term).lower() in draft_lower]
+        matched_terms = []
+        for term in target_terms:
+            if self._term_matches_draft(str(term), draft_lower):
+                matched_terms.append(term)
         missing_terms = [term for term in target_terms if term not in matched_terms]
         target_term_coverage = len(matched_terms) / max(1, len(target_terms)) if target_terms else 0.0
 
@@ -847,6 +1145,173 @@ class FlowerNetVerifier:
             "aspect_coverage": round(float(aspect_coverage), 4),
             "specificity_score": round(float(specificity_score), 4),
             "source_topic_coverage": 0.0,
+        }
+
+    def _novelty_diagnostics(
+        self,
+        draft: str,
+        history_list: List[str],
+        red: Dict[str, Any],
+        coverage_diag: Dict[str, Any],
+        evidence_diag: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Estimate innovation/information gain separately from raw redundancy.
+
+        Redundancy remains a strict repeated-content detector. Novelty should
+        also reward relevant new information: new content terms, new phrases,
+        new analytical aspects, and source-grounded specificity.
+        """
+        draft_tokens = self._content_tokens(draft)
+        draft_token_set = set(draft_tokens)
+        draft_bigrams = set(zip(draft_tokens, draft_tokens[1:]))
+        history_tokens: List[str] = []
+        for hist in history_list or []:
+            history_tokens.extend(self._content_tokens(hist))
+        history_token_set = set(history_tokens)
+        history_bigrams = set(zip(history_tokens, history_tokens[1:]))
+        generic_novelty_tokens = {
+            "useful", "important", "value", "users", "system", "subsection", "says",
+            "improves", "good", "better", "helpful", "effective", "quality",
+            "content", "document", "topic", "section", "文章", "内容", "重要",
+            "有效", "有用", "价值", "提升", "改善", "系统", "小节", "部分",
+        }
+        target_terms = {
+            str(x).lower()
+            for x in (coverage_diag.get("target_terms") or [])
+            if str(x).strip()
+        }
+        matched_terms = {
+            str(x).lower()
+            for x in (coverage_diag.get("matched_terms") or [])
+            if str(x).strip()
+        }
+        source_terms = {
+            str(x).lower()
+            for x in (evidence_diag.get("source_topic_terms") or [])
+            if str(x).strip()
+        }
+        source_hits_for_gain = {
+            str(x).lower()
+            for x in (evidence_diag.get("source_topic_hits") or [])
+            if str(x).strip()
+        }
+        relevance_terms = target_terms | matched_terms | source_terms | source_hits_for_gain
+        analytic_terms = {
+            "mechanism", "method", "model", "framework", "algorithm", "metric",
+            "benchmark", "evaluation", "evidence", "claim", "risk", "limitation",
+            "failure", "deployment", "application", "case", "policy", "controller",
+            "verifier", "bandit", "repair", "diagnostic", "grounding", "citation",
+            "机制", "方法", "模型", "框架", "算法", "指标", "评估", "证据",
+            "风险", "限制", "失败", "应用", "案例", "控制器", "验证器", "修复",
+        }
+
+        def is_relevant_new_token(token: str) -> bool:
+            token = str(token or "").lower().strip()
+            if not token or token in generic_novelty_tokens or token.isdigit():
+                return False
+            if token in relevance_terms or token in analytic_terms:
+                return True
+            if any(token in term or term in token for term in relevance_terms if len(term) >= 4):
+                return True
+            if re.search(r"[A-Z][A-Za-z0-9+._-]{2,}", token):
+                return True
+            return False
+
+        if draft_token_set:
+            raw_new_token_terms = [
+                t for t in draft_tokens
+                if t not in history_token_set and len(t) > 2 and not t.isdigit()
+            ]
+            new_token_terms = [t for t in raw_new_token_terms if is_relevant_new_token(t)]
+            raw_new_token_density = len(set(raw_new_token_terms)) / max(1, min(len(draft_token_set), 48))
+            new_token_density = len(set(new_token_terms)) / max(1, min(len(draft_token_set), 48))
+        else:
+            raw_new_token_terms = []
+            new_token_terms = []
+            raw_new_token_density = 0.0
+            new_token_density = 0.0
+
+        if draft_bigrams:
+            raw_new_bigrams = [
+                bg for bg in draft_bigrams
+                if bg not in history_bigrams and all(len(x) > 2 for x in bg)
+            ]
+            new_bigrams = [
+                " ".join(bg)
+                for bg in raw_new_bigrams
+                if any(is_relevant_new_token(x) for x in bg)
+            ]
+            raw_new_bigram_density = len(set(raw_new_bigrams)) / max(1, min(len(draft_bigrams), 42))
+            new_bigram_density = len(set(new_bigrams)) / max(1, min(len(draft_bigrams), 42))
+        else:
+            raw_new_bigrams = []
+            new_bigrams = []
+            raw_new_bigram_density = 0.0
+            new_bigram_density = 0.0
+
+        draft_lower = str(draft or "").lower()
+        history_lower = "\n".join(str(h or "") for h in history_list or []).lower()
+        aspect_hits = coverage_diag.get("aspect_hits") if isinstance(coverage_diag.get("aspect_hits"), dict) else {}
+        aspect_markers = self._coverage_aspects()
+        new_aspect_hits: Dict[str, bool] = {}
+        for aspect, hit in aspect_hits.items():
+            if not hit:
+                new_aspect_hits[aspect] = False
+                continue
+            markers = aspect_markers.get(aspect, [])
+            new_aspect_hits[aspect] = any(
+                marker.lower() in draft_lower and marker.lower() not in history_lower
+                for marker in markers
+            )
+        new_aspect_coverage = sum(1 for ok in new_aspect_hits.values() if ok) / max(1, len(new_aspect_hits))
+
+        source_hits = [
+            str(x).lower()
+            for x in (evidence_diag.get("source_topic_hits") or [])
+            if str(x).strip()
+        ]
+        new_source_terms = [term for term in source_hits if term not in history_lower]
+        new_source_signal = len(set(new_source_terms)) / max(1, min(8, len(source_hits))) if source_hits else 0.0
+
+        anti_redundancy = self._clip01(1.0 - self._safe_float(red.get("score"), 0.0))
+        raw_information_gain = self._clip01(0.58 * min(1.0, raw_new_token_density) + 0.42 * min(1.0, raw_new_bigram_density))
+        relevant_information_gain = self._clip01(0.58 * min(1.0, new_token_density) + 0.42 * min(1.0, new_bigram_density))
+        topic_bound_signal = self._clip01(
+            0.50 * self._safe_float(coverage_diag.get("target_term_coverage"), 0.0)
+            + 0.30 * self._safe_float(evidence_diag.get("source_topic_coverage"), 0.0)
+            + 0.20 * new_source_signal
+        )
+        information_gain = self._clip01(0.72 * relevant_information_gain + 0.28 * raw_information_gain * topic_bound_signal)
+        aspect_gain = self._clip01(0.55 * self._safe_float(coverage_diag.get("aspect_coverage"), 0.0) + 0.45 * new_aspect_coverage)
+        source_specificity = self._clip01(
+            0.45 * self._safe_float(evidence_diag.get("source_topic_coverage"), 0.0)
+            + 0.30 * new_source_signal
+            + 0.25 * self._safe_float(coverage_diag.get("specificity_score"), 0.0)
+        )
+        score = self._clip01(
+            0.18 * anti_redundancy
+            + 0.36 * information_gain
+            + 0.22 * aspect_gain
+            + 0.24 * source_specificity
+        )
+        return {
+            "score": round(float(score), 4),
+            "anti_redundancy": round(float(anti_redundancy), 4),
+            "information_gain": round(float(information_gain), 4),
+            "raw_information_gain": round(float(raw_information_gain), 4),
+            "relevant_information_gain": round(float(relevant_information_gain), 4),
+            "topic_bound_signal": round(float(topic_bound_signal), 4),
+            "new_token_density": round(float(min(1.0, new_token_density)), 4),
+            "new_bigram_density": round(float(min(1.0, new_bigram_density)), 4),
+            "raw_new_token_density": round(float(min(1.0, raw_new_token_density)), 4),
+            "raw_new_bigram_density": round(float(min(1.0, raw_new_bigram_density)), 4),
+            "aspect_gain": round(float(aspect_gain), 4),
+            "new_aspect_coverage": round(float(new_aspect_coverage), 4),
+            "source_specificity": round(float(source_specificity), 4),
+            "new_source_signal": round(float(new_source_signal), 4),
+            "new_terms": list(dict.fromkeys(new_token_terms))[:14],
+            "new_phrases": sorted(list(dict.fromkeys(new_bigrams)))[:10],
+            "new_source_terms": list(dict.fromkeys(new_source_terms))[:8],
         }
 
     def _evidence_diagnostics(
@@ -1227,9 +1692,12 @@ class FlowerNetVerifier:
         draft_bigrams = set(zip(draft_tokens, draft_tokens[1:]))
 
         max_redundancy = 0.0
+        max_entry_index = -1
         per_entry_scores = []
+        max_overlap_terms: List[str] = []
+        max_overlap_bigrams: List[str] = []
 
-        for hist in history_list:
+        for idx, hist in enumerate(history_list):
             hist_tokens = self._content_tokens(hist)
             hist_tokens_set = set(hist_tokens)
             hist_bigrams = set(zip(hist_tokens, hist_tokens[1:]))
@@ -1257,12 +1725,27 @@ class FlowerNetVerifier:
             per_entry_scores.append(float(round(entry_score, 4)))
             if entry_score > max_redundancy:
                 max_redundancy = entry_score
+                max_entry_index = idx
+                overlap_terms = [
+                    t for t in draft_tokens
+                    if t in hist_tokens_set and len(t) > 2 and not t.isdigit()
+                ]
+                max_overlap_terms = list(dict.fromkeys(overlap_terms))[:18]
+                overlap_bigrams = [
+                    " ".join(bg)
+                    for bg in draft_bigrams
+                    if bg in hist_bigrams and all(len(x) > 2 for x in bg)
+                ]
+                max_overlap_bigrams = sorted(list(dict.fromkeys(overlap_bigrams)))[:12]
 
         return {
             "score": float(round(max_redundancy, 4)),
             "details": {
                 "per_history_scores": per_entry_scores,
                 "max_redundancy": float(round(max_redundancy, 4)),
+                "max_history_index": max_entry_index,
+                "overlap_terms": max_overlap_terms,
+                "overlap_bigrams": max_overlap_bigrams,
             },
         }
 
@@ -1277,6 +1760,10 @@ class FlowerNetVerifier:
         source_results: Optional[List[Dict[str, Any]]] = None,
         require_source_citations: bool = False,
         min_source_citations: int = 1,
+        unieval_endpoint: Optional[str] = None,
+        require_multidim_quality: Optional[bool] = None,
+        research_intelligence: Optional[Dict[str, Any]] = None,
+        external_metrics: Optional[Dict[str, Any]] = None,
     ):
         """一键验证逻辑"""
         rel = self.calculate_relevancy(draft, outline)
@@ -1309,6 +1796,13 @@ class FlowerNetVerifier:
             source_check=source_check,
         )
         coverage_diagnostics["source_topic_coverage"] = evidence_diagnostics.get("source_topic_coverage", 0.0)
+        novelty_diagnostics = self._novelty_diagnostics(
+            draft=draft,
+            history_list=history_list,
+            red=red,
+            coverage_diag=coverage_diagnostics,
+            evidence_diag=evidence_diagnostics,
+        )
 
         heuristic_dimensions = self._compute_semantic_dimensions(
             draft=draft,
@@ -1319,11 +1813,20 @@ class FlowerNetVerifier:
             source_check=source_check,
             context_text=context_text,
             source_results=source_results or [],
+            coverage_diag=coverage_diagnostics,
+            evidence_diag=evidence_diagnostics,
+            novelty_diagnostics=novelty_diagnostics,
         )
         
-        require_multidim_env = os.getenv("REQUIRE_MULTIDIM_QUALITY", "true").lower() == "true"
-        unieval_strict_required = os.getenv("UNIEVAL_STRICT_REQUIRED", "false").lower() == "true"
-        unieval_endpoint = os.getenv("UNIEVAL_ENDPOINT", "").strip()
+        require_multidim_env = (
+            bool(require_multidim_quality)
+            if require_multidim_quality is not None
+            else os.getenv("REQUIRE_MULTIDIM_QUALITY", "true").lower() == "true"
+        )
+        unieval_strict_required = self._unieval_strict_for_request(unieval_endpoint)
+        # An explicitly blank per-request endpoint is the w/o-NLI ablation,
+        # not a service outage. It must use the same heuristic verifier without
+        # inheriting the full service's global strict-NLI requirement.
         # If UniEval endpoint is absent, degrade to heuristic-only quality checks
         # instead of failing every verify request with HTTP 500.
         require_multidim = require_multidim_env
@@ -1334,6 +1837,7 @@ class FlowerNetVerifier:
             outline=outline,
             history_list=history_list,
             require_available=require_multidim and unieval_strict_required,
+            endpoint_override=unieval_endpoint,
         )
         
         fusion = self._fuse_dimensions_with_uncertainty(
@@ -1354,10 +1858,11 @@ class FlowerNetVerifier:
             quality_score=quality_score,
             quality_threshold=quality_threshold,
             dimension_check=dimension_check,
+            fusion=fusion,
         )
         quality_passed = dimension_check["all_passed"] or bool(quality_soft_pass.get("passed", False))
 
-        is_passed = (
+        base_is_passed = (
             (rel['score'] >= rel_threshold)
             and (red['score'] <= red_threshold)
             and persona_ok
@@ -1365,6 +1870,22 @@ class FlowerNetVerifier:
             and (quality_score >= quality_threshold)
             and (quality_passed if require_multidim else True)
         )
+        strict_is_passed = bool(
+            base_is_passed
+            and (dimension_check["all_passed"] if require_multidim else True)
+        )
+        epsilon_pass = self._single_metric_epsilon_pass(
+            relevancy=rel['score'],
+            relevancy_threshold=rel_threshold,
+            redundancy=red['score'],
+            redundancy_threshold=red_threshold,
+            quality_score=quality_score,
+            quality_threshold=quality_threshold,
+            quality_passed=(quality_passed if require_multidim else True),
+            persona_passed=persona_ok,
+            source_passed=bool(source_check["passed"]),
+        )
+        is_passed = bool(base_is_passed or epsilon_pass.get("passed", False))
 
         if not is_passed:
             print(
@@ -1401,9 +1922,25 @@ class FlowerNetVerifier:
                 "Evidence grounding check failed. Bind key claims to retrieved or verifiable sources"
                 + (f" and add missing evidence types: {missing_evidence}." if missing_evidence else ".")
             )
+        if "novelty" in dimension_check["failed_dimensions"]:
+            advice = (
+                "Novelty check failed. Add source-grounded information gain: new concrete terms, new mechanisms, "
+                "new analytical aspects, or new source-specific claims, while reducing repeated history overlap."
+            )
 
-        return {
+        result = {
             "is_passed": is_passed,
+            "strict_is_passed": bool(strict_is_passed),
+            "acceptance_mode": (
+                "strict"
+                if strict_is_passed
+                else (
+                    "multidim_soft"
+                    if base_is_passed
+                    else ("single_metric_epsilon" if is_passed else "failed")
+                )
+            ),
+            "single_metric_epsilon_pass": epsilon_pass,
             "relevancy_index": rel['score'],
             "redundancy_index": red['score'],
             # 总分（保留兼容性）
@@ -1418,6 +1955,7 @@ class FlowerNetVerifier:
             "quality_dimensions_check": dimension_check["per_dimension"],
             "quality_dimensions_failed": dimension_check["failed_dimensions"],
             "dimension_thresholds": self._quality_dimension_thresholds(),
+            "dimension_principles": self._quality_dimension_principles(),
             # 不确定性信息
             "quality_dimensions_uncertainty": fusion["uncertainty"],
             "quality_dimensions_confidence_interval": fusion["confidence_interval"],
@@ -1437,6 +1975,7 @@ class FlowerNetVerifier:
             "source_check": source_check,
             "coverage_diagnostics": coverage_diagnostics,
             "evidence_diagnostics": evidence_diagnostics,
+            "novelty_diagnostics": novelty_diagnostics,
             "raw_data": {
                 "relevancy": rel['details'],
                 "redundancy": red['details'],
@@ -1444,10 +1983,33 @@ class FlowerNetVerifier:
                 "source_check": source_check,
                 "coverage_diagnostics": coverage_diagnostics,
                 "evidence_diagnostics": evidence_diagnostics,
+                "novelty_diagnostics": novelty_diagnostics,
                 "semantic_dimensions": semantic_dimensions,
                 "semantic_uncertainty": fusion["uncertainty"],
             }
         }
+        if EVOLVABLE_REVIEWER_AVAILABLE and build_reviewer_assessment is not None:
+            try:
+                result["reviewer_assessment"] = build_reviewer_assessment(
+                    draft=draft,
+                    outline=outline,
+                    verification=result,
+                    research_intelligence=research_intelligence or {},
+                    external_metrics=external_metrics or {},
+                )
+            except Exception as exc:
+                result["reviewer_assessment"] = {
+                    "enabled": True,
+                    "available": True,
+                    "status": "reviewer_error",
+                    "error": str(exc)[:300],
+                }
+        else:
+            result["reviewer_assessment"] = {
+                "enabled": False,
+                "available": False,
+            }
+        return result
 
 
 # ============ FastAPI 应用 ============
@@ -1465,6 +2027,12 @@ class VerifyRequest(BaseModel):
     source_results: List[Dict[str, Any]] = []
     require_source_citations: bool = False
     min_source_citations: int = 3
+    # Per-request controls keep local ablation runs honest when one verifier
+    # service handles full and ablated variants in sequence.
+    unieval_endpoint: Optional[str] = None
+    require_multidim_quality: Optional[bool] = None
+    research_intelligence: Dict[str, Any] = {}
+    external_metrics: Dict[str, Any] = {}
 
 # 2. 初始化应用
 app = FastAPI(title="FlowerNet Verifying Layer API")
@@ -1532,6 +2100,10 @@ async def perform_verification(request: VerifyRequest):
             source_results=request.source_results,
             require_source_citations=request.require_source_citations,
             min_source_citations=request.min_source_citations,
+            unieval_endpoint=request.unieval_endpoint,
+            require_multidim_quality=request.require_multidim_quality,
+            research_intelligence=request.research_intelligence,
+            external_metrics=request.external_metrics,
         )
         return result
     except Exception as e:

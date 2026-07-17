@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional, Tuple
 import os
@@ -79,7 +79,15 @@ def _default_bandit_state(feature_dim: int) -> Dict[str, Any]:
             "rule_structured": {"count": 0, "weights": [0.0] * feature_dim, "bias": 0.0, "avg_latency": 0.0, "avg_cost": 0.0, "ineffective_streak": 0},
             "defect_topic": {"count": 0, "weights": [0.0] * feature_dim, "bias": 0.0, "avg_latency": 0.0, "avg_cost": 0.0, "ineffective_streak": 0},
             "defect_evidence": {"count": 0, "weights": [0.0] * feature_dim, "bias": 0.0, "avg_latency": 0.0, "avg_cost": 0.0, "ineffective_streak": 0},
+            "defect_novelty": {"count": 0, "weights": [0.0] * feature_dim, "bias": 0.0, "avg_latency": 0.0, "avg_cost": 0.0, "ineffective_streak": 0},
             "defect_structure": {"count": 0, "weights": [0.0] * feature_dim, "bias": 0.0, "avg_latency": 0.0, "avg_cost": 0.0, "ineffective_streak": 0},
+            "novelty_repair": {"count": 0, "weights": [0.0] * feature_dim, "bias": 0.0, "avg_latency": 0.0, "avg_cost": 0.0, "ineffective_streak": 0},
+            "claim_evidence_repair": {"count": 0, "weights": [0.0] * feature_dim, "bias": 0.0, "avg_latency": 0.0, "avg_cost": 0.0, "ineffective_streak": 0},
+            "citation_grounding_repair": {"count": 0, "weights": [0.0] * feature_dim, "bias": 0.0, "avg_latency": 0.0, "avg_cost": 0.0, "ineffective_streak": 0},
+            "reviewer_risk_repair": {"count": 0, "weights": [0.0] * feature_dim, "bias": 0.0, "avg_latency": 0.0, "avg_cost": 0.0, "ineffective_streak": 0},
+            "external_metric_repair": {"count": 0, "weights": [0.0] * feature_dim, "bias": 0.0, "avg_latency": 0.0, "avg_cost": 0.0, "ineffective_streak": 0},
+            "structure_readability_repair": {"count": 0, "weights": [0.0] * feature_dim, "bias": 0.0, "avg_latency": 0.0, "avg_cost": 0.0, "ineffective_streak": 0},
+            "reproducibility_repair": {"count": 0, "weights": [0.0] * feature_dim, "bias": 0.0, "avg_latency": 0.0, "avg_cost": 0.0, "ineffective_streak": 0},
         },
     }
 
@@ -99,6 +107,8 @@ def _load_bandit_state(feature_dim: int) -> Dict[str, Any]:
         arms = data.get("arms") if isinstance(data.get("arms"), dict) else {}
         for arm_name in default_state["arms"].keys():
             arm_data = arms.get(arm_name, {})
+            if not arm_data:
+                continue
             weights = arm_data.get("weights") if isinstance(arm_data, dict) else None
             if not isinstance(weights, list) or len(weights) != feature_dim:
                 return default_state
@@ -122,6 +132,9 @@ def _load_bandit_state(feature_dim: int) -> Dict[str, Any]:
 def _save_bandit_state(state: Dict[str, Any]) -> None:
     path = _bandit_state_path()
     try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -134,6 +147,15 @@ def _dot(weights: List[float], features: List[float]) -> float:
 
 def _clip01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
+
+
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    if value is None or value == "":
+        return float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
 
 
 def _trained_controller_policy_path() -> str:
@@ -181,6 +203,9 @@ def _ope_events_path() -> str:
 def _append_ope_event(event: Dict[str, Any]) -> None:
     try:
         path = _ope_events_path()
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
     except Exception as e:
@@ -197,28 +222,158 @@ def _extract_uncertainty_dims(feedback: Dict[str, Any]) -> Dict[str, float]:
     return {k: _clip01(float(v)) for k, v in unc_raw.items() if isinstance(v, (int, float))}
 
 
+def _reviewer_dimension_scores(feedback: Dict[str, Any]) -> Dict[str, float]:
+    reviewer = feedback.get("reviewer_assessment") if isinstance(feedback.get("reviewer_assessment"), dict) else {}
+    dims = reviewer.get("reviewer_dimensions") if isinstance(reviewer.get("reviewer_dimensions"), dict) else {}
+    out: Dict[str, float] = {}
+    for name, payload in dims.items():
+        if isinstance(payload, dict):
+            out[str(name)] = _clip01(_coerce_float(payload.get("score"), 0.0))
+    return out
+
+
+def _reviewer_external_alignment(feedback: Dict[str, Any]) -> Dict[str, Any]:
+    reviewer = feedback.get("reviewer_assessment") if isinstance(feedback.get("reviewer_assessment"), dict) else {}
+    alignment = reviewer.get("external_alignment") if isinstance(reviewer.get("external_alignment"), dict) else {}
+    return alignment if isinstance(alignment, dict) else {}
+
+
 def _build_defect_graph(feedback: Dict[str, Any], rel_score: float, red_score: float, rel_threshold: float, red_threshold: float) -> Dict[str, float]:
     dims = _extract_quality_dims(feedback)
     unc = _extract_uncertainty_dims(feedback)
+    thresholds = feedback.get("dimension_thresholds") if isinstance(feedback.get("dimension_thresholds"), dict) else {}
+    failed_dims_raw = feedback.get("quality_dimensions_failed")
+    failed_dims = {str(x) for x in failed_dims_raw} if isinstance(failed_dims_raw, list) else set()
+    evidence_diag = feedback.get("evidence_diagnostics") if isinstance(feedback.get("evidence_diagnostics"), dict) else {}
+    source_check = feedback.get("source_check") if isinstance(feedback.get("source_check"), dict) else {}
+    source_alignment = feedback.get("source_alignment") if isinstance(feedback.get("source_alignment"), dict) else {}
+    try:
+        source_usage = float(evidence_diag.get("source_usage_coverage", 1.0))
+    except Exception:
+        source_usage = 1.0
+    try:
+        claim_alignment = float(evidence_diag.get("claim_evidence_alignment", 1.0))
+    except Exception:
+        claim_alignment = 1.0
+    source_failures = evidence_diag.get("source_failures") if isinstance(evidence_diag.get("source_failures"), list) else []
+    severe_source_failures = {
+        str(item)
+        for item in source_failures
+        if str(item) not in {"insufficient_citations", "missing_evidence_type:application_or_case"}
+    }
+    soft_citation_only_failure = bool(source_failures) and not severe_source_failures
+    source_passed = bool(source_check.get("passed", True))
+    source_alignment_score = _clip01(_coerce_float(source_alignment.get("score"), 1.0))
+    source_alignment_terms = _clip01(_coerce_float(source_alignment.get("term_coverage"), source_alignment_score))
+    source_alignment_bigrams = _clip01(_coerce_float(source_alignment.get("bigram_overlap"), source_alignment_score))
+    source_alignment_count = int(source_alignment.get("source_count", 0) or 0)
+    # This is a controller target, not the verifier's hard accept threshold.
+    # RAG-backed paper generation needs enough source phrase preservation for
+    # traceability and external ROUGE/BERTScore stability, while the generator
+    # prompt still forbids mechanical keyword stuffing.
+    source_alignment_floor = _clip01(float(os.getenv("CONTROLLER_SOURCE_ALIGNMENT_FLOOR", "0.76")))
+    source_alignment_defect = 0.0
+    if source_alignment_count > 0 and source_alignment_score < source_alignment_floor:
+        source_alignment_defect = max(
+            max(0.0, source_alignment_floor - source_alignment_score) / max(0.05, source_alignment_floor),
+            0.65 * max(0.0, source_alignment_floor - source_alignment_terms) / max(0.05, source_alignment_floor),
+            0.45 * max(0.0, source_alignment_floor - source_alignment_bigrams) / max(0.05, source_alignment_floor),
+        )
+        source_alignment_defect = _clip01(max(0.12, source_alignment_defect))
 
-    topic_defect = _clip01(max(0.0, rel_threshold - rel_score) + (1.0 - dims.get("topic_alignment", 0.0)) * 0.6)
-    coverage_defect = _clip01(1.0 - dims.get("coverage_completeness", 0.0))
-    evidence_defect = _clip01(1.0 - dims.get("evidence_grounding", 0.0))
-    structure_defect = _clip01(1.0 - dims.get("structure_clarity", 0.0))
-    coherence_defect = _clip01(1.0 - dims.get("logical_coherence", 0.0))
-    redundancy_defect = _clip01(max(0.0, red_score - red_threshold))
+    def dim_gap(name: str, default_threshold: float) -> float:
+        threshold = float(thresholds.get(name, default_threshold) or default_threshold)
+        value = float(dims.get(name, 0.0) or 0.0)
+        raw_gap = max(0.0, threshold - value) / max(0.05, threshold)
+        if name in failed_dims:
+            return _clip01(max(raw_gap, 0.12))
+        return _clip01(raw_gap)
+
+    relevance_gate_failed = rel_score < rel_threshold
+    topic_defect = _clip01(max(0.0, rel_threshold - rel_score) / max(0.05, rel_threshold) + dim_gap("topic_alignment", 0.41))
+    if relevance_gate_failed:
+        # A failed top-level relevance gate is a hard defect. Soft evidence
+        # diagnostics must not redirect the repair away from the failed gate.
+        topic_defect = max(topic_defect, 0.12)
+    coverage_defect = dim_gap("coverage_completeness", 0.40)
+    evidence_soft_defect = max(
+        0.0,
+        0.55 * max(0.0, 0.92 - source_usage),
+        0.70 * max(0.0, 0.62 - claim_alignment),
+        source_alignment_defect,
+        0.35 if severe_source_failures else 0.10 if soft_citation_only_failure else 0.0,
+        0.25 if (not source_passed and not soft_citation_only_failure) else 0.0,
+    )
+    evidence_hard_defect = (
+        "evidence_grounding" in failed_dims
+        or (not source_passed and not soft_citation_only_failure)
+        or bool(severe_source_failures)
+        or source_alignment_defect >= float(os.getenv("CONTROLLER_SOURCE_ALIGNMENT_HARD_DEFECT_MIN", "0.12"))
+    )
+    evidence_defect = _clip01(max(dim_gap("evidence_grounding", 0.18), evidence_soft_defect))
+    novelty_defect = dim_gap("novelty", 0.66)
+    structure_defect = dim_gap("structure_clarity", 0.36)
+    coherence_defect = dim_gap("logical_coherence", 0.25)
+    redundancy_gate_failed = red_score > red_threshold
+    redundancy_defect = _clip01(max(0.0, red_score - red_threshold) / max(0.05, 1.0 - red_threshold))
+    if redundancy_gate_failed:
+        redundancy_defect = max(redundancy_defect, 0.12)
+
+    # Hard acceptance-gate failures take priority over soft diagnostics. A soft
+    # claim-alignment warning may guide the prompt, but it must not redirect the
+    # selected arm away from a failed relevance or redundancy gate.
+    hard_gate_priority = max(topic_defect if relevance_gate_failed else 0.0, redundancy_defect)
+    if hard_gate_priority and not evidence_hard_defect:
+        evidence_defect = min(evidence_defect, max(0.0, hard_gate_priority - 0.01))
 
     # Uncertainty boosts risk-sensitive repair priority.
     uncertainty_pressure = _clip01(sum(unc.values()) / max(1, len(unc))) if unc else 0.0
+    reviewer_dims = _reviewer_dimension_scores(feedback)
+
+    def reviewer_gap(name: str, floor: float = 0.70) -> float:
+        if name not in reviewer_dims:
+            return 0.0
+        return _clip01(max(0.0, floor - reviewer_dims[name]) / max(0.05, floor))
+
+    external_alignment = _reviewer_external_alignment(feedback)
+    external_metric_defect = 0.0
+    if external_alignment.get("available"):
+        external_mean = _coerce_float(external_alignment.get("external_mean"), 0.0)
+        internal_mean = _coerce_float(external_alignment.get("internal_mean"), 0.0)
+        if external_alignment.get("aligned_with_external_metrics") is False:
+            external_metric_defect = max(0.18, _clip01(max(0.0, internal_mean - external_mean) / 0.35))
+
+    citation_grounding_defect = max(reviewer_gap("citation_faithfulness"), evidence_defect if not source_passed else 0.0)
+    claim_evidence_defect = max(reviewer_gap("claim_support"), evidence_defect * 0.75)
+    novelty_repair_defect = max(reviewer_gap("novelty_strength"), novelty_defect, redundancy_defect * 0.6)
+    reviewer_risk_defect = max(reviewer_gap("reviewer_concern_prediction"), external_metric_defect * 0.75)
+    structure_readability_defect = max(
+        reviewer_gap("logical_coherence"),
+        reviewer_gap("experimental_completeness") * 0.35,
+        structure_defect,
+        coherence_defect,
+    )
+    reproducibility_defect = max(reviewer_gap("reproducibility_risk"), reviewer_gap("experimental_completeness") * 0.55)
 
     return {
         "topic": round(topic_defect, 4),
         "coverage": round(coverage_defect, 4),
         "evidence": round(evidence_defect, 4),
+        "source_alignment": round(source_alignment_defect, 4),
+        "novelty": round(novelty_defect, 4),
         "structure": round(structure_defect, 4),
         "coherence": round(coherence_defect, 4),
         "redundancy": round(redundancy_defect, 4),
+        "hard_relevance_gate": 1.0 if relevance_gate_failed else 0.0,
+        "hard_redundancy_gate": 1.0 if redundancy_gate_failed else 0.0,
         "uncertainty_pressure": round(uncertainty_pressure, 4),
+        "novelty_repair": round(novelty_repair_defect, 4),
+        "claim_evidence": round(claim_evidence_defect, 4),
+        "citation_grounding": round(citation_grounding_defect, 4),
+        "reviewer_risk": round(reviewer_risk_defect, 4),
+        "external_metric": round(external_metric_defect, 4),
+        "structure_readability": round(structure_readability_defect, 4),
+        "reproducibility": round(reproducibility_defect, 4),
     }
 
 
@@ -311,10 +466,13 @@ def _estimate_arm_cost_latency(source: str, prompt_len: int, output_len: int, ll
     elif source == "defect_topic":
         token_cost = max(1.0, output_len / 7.0)
         latency = 0.02
-    elif source == "defect_evidence":
+    elif source in {"defect_evidence", "claim_evidence_repair", "citation_grounding_repair", "external_metric_repair", "reproducibility_repair", "reviewer_risk_repair"}:
         token_cost = max(1.0, output_len / 7.0)
         latency = 0.02
-    elif source == "defect_structure":
+    elif source in {"defect_novelty", "novelty_repair"}:
+        token_cost = max(1.0, output_len / 7.0)
+        latency = 0.02
+    elif source in {"defect_structure", "structure_readability_repair"}:
         token_cost = max(1.0, output_len / 7.0)
         latency = 0.02
     else:
@@ -459,7 +617,10 @@ def _build_bandit_context_features(
         _clip01(sum(unc.values()) / max(1, len(unc))) if unc else 0.0,
         _clip01(float(defect_graph.get("topic", 0.0))),
         _clip01(float(defect_graph.get("evidence", 0.0))),
+        _clip01(float(defect_graph.get("novelty", 0.0))),
+        _clip01(float(defect_graph.get("redundancy", 0.0))),
         _clip01(float(defect_graph.get("structure", 0.0))),
+        _clip01(float(defect_graph.get("coherence", 0.0))),
         _clip01(float(defect_graph.get("uncertainty_pressure", 0.0))),
         _extract_numeric_suffix(section_id),
         _extract_numeric_suffix(subsection_id),
@@ -499,7 +660,15 @@ def _bandit_choose_arm(
         "rule_structured": 0.5 * defect_graph.get("structure", 0.0) + 0.25 * defect_graph.get("coherence", 0.0),
         "defect_topic": 0.8 * defect_graph.get("topic", 0.0) + 0.2 * defect_graph.get("coverage", 0.0),
         "defect_evidence": 0.8 * defect_graph.get("evidence", 0.0) + 0.2 * defect_graph.get("coverage", 0.0),
+        "defect_novelty": 0.75 * defect_graph.get("novelty", 0.0) + 0.15 * defect_graph.get("redundancy", 0.0) + 0.10 * defect_graph.get("coverage", 0.0),
         "defect_structure": 0.8 * defect_graph.get("structure", 0.0) + 0.2 * defect_graph.get("coherence", 0.0),
+        "novelty_repair": 0.8 * defect_graph.get("novelty_repair", defect_graph.get("novelty", 0.0)) + 0.2 * defect_graph.get("redundancy", 0.0),
+        "claim_evidence_repair": 0.85 * defect_graph.get("claim_evidence", defect_graph.get("evidence", 0.0)) + 0.15 * defect_graph.get("evidence", 0.0),
+        "citation_grounding_repair": 0.85 * defect_graph.get("citation_grounding", defect_graph.get("evidence", 0.0)) + 0.15 * defect_graph.get("source_alignment", 0.0),
+        "reviewer_risk_repair": 0.65 * defect_graph.get("reviewer_risk", 0.0) + 0.20 * defect_graph.get("external_metric", 0.0) + 0.15 * defect_graph.get("uncertainty_pressure", 0.0),
+        "external_metric_repair": 0.85 * defect_graph.get("external_metric", 0.0) + 0.15 * defect_graph.get("source_alignment", 0.0),
+        "structure_readability_repair": 0.65 * defect_graph.get("structure_readability", defect_graph.get("structure", 0.0)) + 0.25 * defect_graph.get("coherence", 0.0) + 0.10 * defect_graph.get("structure", 0.0),
+        "reproducibility_repair": 0.85 * defect_graph.get("reproducibility", 0.0) + 0.15 * defect_graph.get("evidence", 0.0),
     }
 
     scores: Dict[str, Dict[str, float]] = {}
@@ -541,6 +710,64 @@ def _bandit_choose_arm(
     if not scores:
         return available_arms[0], {"mode": "fallback", "scores": {}}
 
+    hard_gate_min = max(0.0, min(1.0, float(os.getenv("CONTROLLER_HARD_GATE_ARM_MIN_DEFECT", "0.08"))))
+    hard_gate_choice = ""
+    if (
+        "defect_topic" in scores
+        and float(defect_graph.get("hard_relevance_gate", 0.0) or 0.0) > 0.0
+        and float(defect_graph.get("topic", 0.0) or 0.0) >= hard_gate_min
+    ):
+        hard_gate_choice = "defect_topic"
+    elif (
+        "defect_novelty" in scores
+        and float(defect_graph.get("hard_redundancy_gate", 0.0) or 0.0) > 0.0
+        and max(
+            float(defect_graph.get("novelty", 0.0) or 0.0),
+            float(defect_graph.get("redundancy", 0.0) or 0.0),
+        )
+        >= hard_gate_min
+    ):
+        hard_gate_choice = "defect_novelty"
+    else:
+        research_gate_map = {
+            "external_metric": "external_metric_repair",
+            "reviewer_risk": "reviewer_risk_repair",
+            "citation_grounding": "citation_grounding_repair",
+            "claim_evidence": "claim_evidence_repair",
+            "reproducibility": "reproducibility_repair",
+            "structure_readability": "structure_readability_repair",
+            "novelty_repair": "novelty_repair",
+        }
+        research_gate_min = max(0.0, min(1.0, float(os.getenv("CONTROLLER_RESEARCH_DEFECT_GATE_MIN", "0.30"))))
+        eligible_research_gates = [
+            (float(defect_graph.get(defect, 0.0) or 0.0), arm, defect)
+            for defect, arm in research_gate_map.items()
+            if arm in scores and float(defect_graph.get(defect, 0.0) or 0.0) >= research_gate_min
+        ]
+        if eligible_research_gates:
+            _, hard_gate_choice, research_gate_defect = max(eligible_research_gates, key=lambda row: row[0])
+    if hard_gate_choice:
+        probs = {arm: (1.0 if arm == hard_gate_choice else 0.0) for arm in scores}
+        return hard_gate_choice, {
+            "mode": "hard_defect_gate" if hard_gate_choice.startswith("defect_") else "research_defect_gate",
+            "scores": scores,
+            "propensity": probs,
+            "epsilon": 0.0,
+            "cooldown_streak": cooldown_streak,
+            "hard_gate": {
+                "selected": hard_gate_choice,
+                "hard_relevance_gate": float(defect_graph.get("hard_relevance_gate", 0.0) or 0.0),
+                "hard_redundancy_gate": float(defect_graph.get("hard_redundancy_gate", 0.0) or 0.0),
+                "topic": float(defect_graph.get("topic", 0.0) or 0.0),
+                "novelty": float(defect_graph.get("novelty", 0.0) or 0.0),
+                "redundancy": float(defect_graph.get("redundancy", 0.0) or 0.0),
+                "research_defect": locals().get("research_gate_defect", ""),
+            },
+            "trained_policy_used": bool(trained_policy),
+            "trained_policy_blend": trained_blend if trained_policy else 0.0,
+            "trained_policy_version": trained_policy.get("version", "") if trained_policy else "",
+        }
+
     drift = state.get("drift") if isinstance(state.get("drift"), dict) else {}
     recent_drift = int(state.get("total_rounds", 0) or 0) - int(drift.get("last_drift_round", 0) or 0) <= 3
     effective_epsilon = min(0.5, epsilon * (2.0 if recent_drift else 1.0))
@@ -574,6 +801,97 @@ def _bandit_choose_arm(
         "trained_policy_used": bool(trained_policy),
         "trained_policy_blend": trained_blend if trained_policy else 0.0,
         "trained_policy_version": trained_policy.get("version", "") if trained_policy else "",
+    }
+
+
+def _apply_request_local_arm_exclusions(
+    candidates: Dict[str, Dict[str, Any]],
+    excluded_arms: List[str],
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """Exclude arms disproven in this subsection without creating a dead end."""
+    exclusions = {
+        str(arm).strip()
+        for arm in (excluded_arms or [])
+        if str(arm).strip()
+    }
+    if not exclusions:
+        return dict(candidates), {}
+    eligible = {
+        arm: candidate
+        for arm, candidate in candidates.items()
+        if arm not in exclusions
+    }
+    if eligible:
+        return eligible, {
+            "request_local_exclusions": sorted(exclusions),
+            "request_local_exclusions_applied": True,
+        }
+    return dict(candidates), {
+        "request_local_exclusions": sorted(exclusions),
+        "request_local_exclusions_applied": False,
+        "request_local_exclusions_fallback": "all_candidates_excluded",
+    }
+
+
+def _filter_defect_compatible_candidates(
+    candidates: Dict[str, Dict[str, Any]],
+    defect_graph: Dict[str, float],
+    failed_dims: List[str],
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """Keep exploration within arms capable of addressing an active defect."""
+    failed = {str(name) for name in (failed_dims or [])}
+    active = set()
+    threshold = float(os.getenv("CONTROLLER_ARM_COMPATIBILITY_MIN_DEFECT", "0.08"))
+    for defect in (
+        "topic", "evidence", "novelty", "structure", "coherence", "redundancy",
+        "claim_evidence", "citation_grounding", "reviewer_risk", "external_metric",
+        "structure_readability", "reproducibility", "novelty_repair",
+    ):
+        if float(defect_graph.get(defect, 0.0) or 0.0) >= threshold:
+            active.add(defect)
+    dimension_defects = {
+        "topic_alignment": "topic",
+        "coverage_completeness": "topic",
+        "evidence_grounding": "evidence",
+        "novelty": "novelty",
+        "structure_clarity": "structure",
+        "logical_coherence": "coherence",
+    }
+    active.update(dimension_defects[name] for name in failed if name in dimension_defects)
+    if not active:
+        return dict(candidates), {}
+
+    capabilities = {
+        "defect_topic": {"topic"},
+        "defect_evidence": {"evidence"},
+        "defect_novelty": {"novelty", "redundancy"},
+        "defect_structure": {"structure", "coherence"},
+        "novelty_repair": {"novelty", "novelty_repair", "redundancy"},
+        "claim_evidence_repair": {"claim_evidence", "evidence"},
+        "citation_grounding_repair": {"citation_grounding", "claim_evidence", "evidence"},
+        "reviewer_risk_repair": {"reviewer_risk", "external_metric", "claim_evidence", "citation_grounding"},
+        "external_metric_repair": {"external_metric", "citation_grounding", "claim_evidence", "evidence"},
+        "structure_readability_repair": {"structure_readability", "structure", "coherence"},
+        "reproducibility_repair": {"reproducibility"},
+        "rule_structured": {"structure", "coherence", "evidence"},
+        "rule": {"topic", "novelty", "redundancy"},
+        "llm": {"topic", "evidence", "novelty", "structure", "coherence"},
+    }
+    compatible = {
+        arm: candidate
+        for arm, candidate in candidates.items()
+        if capabilities.get(arm, set()) & active
+    }
+    if not compatible:
+        return dict(candidates), {
+            "active_defects": sorted(active),
+            "defect_compatibility_applied": False,
+            "defect_compatibility_fallback": "no_compatible_candidate",
+        }
+    return compatible, {
+        "active_defects": sorted(active),
+        "defect_compatibility_applied": True,
+        "defect_incompatible_arms_removed": sorted(set(candidates) - set(compatible)),
     }
 
 
@@ -802,17 +1120,40 @@ def _save_improved_outline_to_db(
         print(f"⚠️  回写改进大纲失败: {e}")
 
 
-def _sanitize_outline_text(text: Optional[str]) -> str:
+def _sanitize_outline_text(
+    text: Optional[str],
+    *,
+    strip_repair_blocks: bool = True,
+) -> str:
     """清洗被规则降级文本污染的大纲，避免相关性计算被元信息拉低。"""
     outline = (text or "").strip()
     if not outline:
         return ""
 
-    # 去掉历史叠加的规则降级片段
-    marker = "【第 "
-    idx = outline.find(marker)
-    if idx > 0:
-        outline = outline[:idx].strip()
+    # Internal repair blocks are generation instructions, not canonical outline
+    # content. Strip them before scoring or composing the next repair so retries
+    # do not accumulate identical blocks and become no-ops.
+    repair_markers = (
+        "【第 ",
+        "【失败维度定向修复建议】",
+        "【主题恢复 / Topic Recovery】",
+        "【主题锁定】",
+        "【证据计划 / Evidence Plan】",
+        "【新颖性修复 / Novelty Repair】",
+        "【结构化修复约束】",
+        "【本地修订约束】",
+        "[Topic Recovery]",
+        "[Topic Lock]",
+        "[Evidence Plan]",
+        "[Novelty Repair]",
+        "[Structure Repair]",
+        "[Local Revision Constraints]",
+    )
+    if strip_repair_blocks:
+        marker_positions = [outline.find(marker) for marker in repair_markers]
+        marker_positions = [position for position in marker_positions if position > 0]
+        if marker_positions:
+            outline = outline[:min(marker_positions)].strip()
 
     # 去掉常见前缀标签
     for prefix in ("改进后大纲：", "改进后的大纲：", "大纲："):
@@ -820,6 +1161,13 @@ def _sanitize_outline_text(text: Optional[str]) -> str:
             outline = outline[len(prefix):].strip()
 
     return outline
+
+
+def _prefers_english_repair_text(*texts: str) -> bool:
+    joined = "\n".join(str(text or "") for text in texts)
+    latin = len(re.findall(r"\b[A-Za-z][A-Za-z0-9+._/-]*\b", joined))
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", joined))
+    return latin >= 8 and latin > max(3, cjk)
 
 
 def _tokenize_text(text: str) -> List[str]:
@@ -952,7 +1300,7 @@ def _score_outline_candidate(
     defect_graph = defect_graph or {}
     coherence_need = _clip01(float(defect_graph.get("coherence", 0.0)))
     topic_need = _clip01(max(rel_gap, float(defect_graph.get("topic", 0.0))))
-    novelty_need = _clip01(max(red_gap, float(defect_graph.get("redundancy", 0.0))))
+    novelty_need = _clip01(max(red_gap, float(defect_graph.get("redundancy", 0.0)), float(defect_graph.get("novelty", 0.0))))
     structure_need = _clip01(float(defect_graph.get("structure", 0.0)))
     evidence_need = _clip01(float(defect_graph.get("evidence", 0.0)))
 
@@ -973,6 +1321,13 @@ def _score_outline_candidate(
     if "evidence_grounding" in failed_dims:
         evidence_weight += 0.12
         structure_weight += 0.03
+    if "novelty" in failed_dims:
+        novelty_weight += 0.16
+        # Novelty repair must add information without weakening source support.
+        # Keep evidence in the objective so a "new" outline does not drift away
+        # from claim-evidence alignment and then get rolled back by no-harm.
+        evidence_weight += 0.02
+        coherence_weight += 0.03
     if topic_need > evidence_need + 0.15:
         # When topic drift is the dominant defect, do not let evidence planning
         # overwhelm the repair objective. Evidence still matters, but topic
@@ -1017,6 +1372,655 @@ def _score_outline_candidate(
     }
 
 
+def _score_value(candidate: Dict[str, Any], name: str, default: float = 0.0) -> float:
+    score = candidate.get("score", {}) if isinstance(candidate.get("score"), dict) else {}
+    try:
+        return float(score.get(name, default) or default)
+    except Exception:
+        return default
+
+
+def _evidence_active_for_novelty_repair(
+    evidence_diag: Dict[str, Any],
+    failed_dims: List[str],
+    defect_graph: Dict[str, float],
+) -> bool:
+    """Treat soft evidence weakness as active during novelty repairs.
+
+    Novelty repairs often rewrite the subsection to reduce repetition. If the
+    current draft already has weak claim-evidence alignment, selecting a
+    novelty-only candidate can make the repair look locally safe while harming
+    grounding and downstream lexical/semantic metrics.
+    """
+    failed = {str(x) for x in failed_dims or []}
+    source_usage = float(evidence_diag.get("source_usage_coverage", 0.0) or 0.0) if isinstance(evidence_diag, dict) else 0.0
+    evidence_type = float(evidence_diag.get("evidence_type_coverage", 0.0) or 0.0) if isinstance(evidence_diag, dict) else 0.0
+    claim_alignment = float(evidence_diag.get("claim_evidence_alignment", 0.0) or 0.0) if isinstance(evidence_diag, dict) else 0.0
+    source_failures = evidence_diag.get("source_failures") if isinstance(evidence_diag, dict) else []
+    if not isinstance(source_failures, list):
+        source_failures = []
+    severe_source_failures = {
+        str(item)
+        for item in source_failures
+        if str(item) not in {"insufficient_citations", "missing_evidence_type:application_or_case"}
+    }
+    weak_source_alignment = (
+        source_usage < float(os.getenv("CONTROLLER_NOVELTY_SOURCE_USAGE_FLOOR", "0.92"))
+        and claim_alignment < float(os.getenv("CONTROLLER_NOVELTY_CLAIM_ALIGNMENT_FLOOR", "0.65"))
+    )
+    severe_claim_gap = claim_alignment < float(os.getenv("CONTROLLER_NOVELTY_SEVERE_CLAIM_ALIGNMENT_FLOOR", "0.45"))
+    severe_evidence_type_gap = evidence_type < float(os.getenv("CONTROLLER_NOVELTY_SEVERE_EVIDENCE_TYPE_FLOOR", "0.55"))
+    return bool(
+        "evidence_grounding" in failed
+        or float(defect_graph.get("evidence", 0.0) or 0.0) >= 0.25
+        or bool(severe_source_failures)
+        or weak_source_alignment
+        or severe_claim_gap
+        or severe_evidence_type_gap
+    )
+
+
+def _select_evidence_preserving_novelty_candidate(
+    chosen: Dict[str, Any],
+    evidence_candidate: Optional[Dict[str, Any]],
+    evidence_guard_active: bool,
+) -> Optional[Dict[str, Any]]:
+    """Prefer an evidence arm when it preserves novelty within a small slack."""
+    if not evidence_guard_active or not chosen or not evidence_candidate:
+        return None
+    chosen_novelty = _score_value(chosen, "novelty")
+    chosen_total = _score_value(chosen, "total")
+    novelty_slack = float(os.getenv("CONTROLLER_EVIDENCE_NOVELTY_SLACK", "0.025"))
+    total_slack = float(os.getenv("CONTROLLER_EVIDENCE_NOVELTY_TOTAL_SLACK", "0.06"))
+    if (
+        _score_value(evidence_candidate, "relevance_anchor") >= 0.92
+        and _score_value(evidence_candidate, "evidence_signal") >= 0.75
+        and _score_value(evidence_candidate, "novelty") >= chosen_novelty - novelty_slack
+        and _score_value(evidence_candidate, "total") >= chosen_total - total_slack
+    ):
+        return evidence_candidate
+    return None
+
+
+def _coherence_repair_blocks_evidence_override(
+    *,
+    chosen_source: str,
+    failed_dims: List[str],
+    defect_graph: Dict[str, float],
+    evidence_diag: Dict[str, Any],
+) -> bool:
+    """Keep coherence repairs targeted unless source/evidence failure is severe."""
+    if str(chosen_source or "") not in {"rule_structured", "defect_structure"}:
+        return False
+    failed = {str(item) for item in failed_dims or []}
+    if "logical_coherence" not in failed or "evidence_grounding" in failed:
+        return False
+    evidence_need = max(
+        float((defect_graph or {}).get("evidence", 0.0) or 0.0),
+        float((defect_graph or {}).get("source_alignment", 0.0) or 0.0),
+    )
+    if evidence_need >= float(os.getenv("CONTROLLER_COHERENCE_GUARD_SEVERE_EVIDENCE_NEED", "0.55")):
+        return False
+    diag = evidence_diag if isinstance(evidence_diag, dict) else {}
+    source_usage = float(diag.get("source_usage_coverage", 0.0) or 0.0)
+    claim_alignment = float(diag.get("claim_evidence_alignment", 0.0) or 0.0)
+    if source_usage < float(os.getenv("CONTROLLER_COHERENCE_GUARD_SEVERE_SOURCE_USAGE", "0.55")):
+        return False
+    if claim_alignment < float(os.getenv("CONTROLLER_COHERENCE_GUARD_SEVERE_CLAIM_ALIGNMENT", "0.45")):
+        return False
+    source_failures = diag.get("source_failures") if isinstance(diag.get("source_failures"), list) else []
+    severe_source_failures = {
+        str(item)
+        for item in source_failures
+        if str(item) not in {"insufficient_citations", "missing_evidence_type:application_or_case"}
+    }
+    if severe_source_failures:
+        return False
+    return True
+
+
+def _select_stalled_topic_complement_candidate(
+    *,
+    hard_gate_arm: str,
+    chosen: Dict[str, Any],
+    best_candidate_by_source: Dict[str, Dict[str, Any]],
+    feedback: Dict[str, Any],
+    rel_score: float,
+    rel_threshold: float,
+    iteration: int,
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """Allow a source/evidence complement when topic hard-gate repair stalls.
+
+    This keeps the hard relevance gate strict on clear topic failures, while
+    avoiding repeated same-arm repairs when the draft is near the relevance
+    threshold and every other verifier dimension already looks safe.
+    """
+    if hard_gate_arm != "defect_topic" or not chosen:
+        return None, {}
+    if int(iteration or 1) < int(os.getenv("CONTROLLER_TOPIC_COMPLEMENT_MIN_ITERATION", "2")):
+        return None, {}
+    source_check = feedback.get("source_check") if isinstance(feedback.get("source_check"), dict) else {}
+    if not bool(source_check.get("passed", False)):
+        return None, {}
+    failed_dims = feedback.get("quality_dimensions_failed") if isinstance(feedback.get("quality_dimensions_failed"), list) else []
+    if failed_dims:
+        return None, {}
+    if feedback.get("quality_score_passed") is False:
+        return None, {}
+    rel_gap = max(0.0, float(rel_threshold or 0.0) - float(rel_score or 0.0))
+    max_gap = max(0.0, float(os.getenv("CONTROLLER_TOPIC_COMPLEMENT_MAX_REL_GAP", "0.055")))
+    if rel_gap <= 0.0 or rel_gap > max_gap:
+        return None, {}
+
+    chosen_total = _score_value(chosen, "total")
+    chosen_relevance = _score_value(chosen, "relevance_anchor")
+    min_total_ratio = max(0.0, min(1.0, float(os.getenv("CONTROLLER_TOPIC_COMPLEMENT_MIN_TOTAL_RATIO", "0.88"))))
+    min_relevance_anchor = max(0.0, min(1.0, float(os.getenv("CONTROLLER_TOPIC_COMPLEMENT_MIN_RELEVANCE_ANCHOR", "0.92"))))
+    min_evidence_signal = max(0.0, min(1.0, float(os.getenv("CONTROLLER_TOPIC_COMPLEMENT_MIN_EVIDENCE_SIGNAL", "0.72"))))
+    candidates = [
+        cand
+        for source, cand in (best_candidate_by_source or {}).items()
+        if (
+            source in {"defect_evidence", "rule_structured"}
+            and _score_value(cand, "evidence_signal") >= min_evidence_signal
+            and _score_value(cand, "relevance_anchor") >= min(min_relevance_anchor, max(0.0, chosen_relevance - 0.03))
+            and _score_value(cand, "total") >= max(1e-6, chosen_total) * min_total_ratio
+        )
+    ]
+    if not candidates:
+        return None, {}
+    selected = max(
+        candidates,
+        key=lambda cand: (
+            0.48 * _score_value(cand, "total")
+            + 0.28 * _score_value(cand, "relevance_anchor")
+            + 0.24 * _score_value(cand, "evidence_signal")
+        ),
+    )
+    return selected, {
+        "reason": "stalled_topic_source_anchor_complement",
+        "hard_gate_arm": hard_gate_arm,
+        "previous_arm": str(chosen.get("source", "")),
+        "new_arm": str(selected.get("source", "")),
+        "rel_gap": round(rel_gap, 4),
+        "max_gap": round(max_gap, 4),
+        "iteration": int(iteration or 1),
+        "previous_total": round(chosen_total, 4),
+        "new_total": round(_score_value(selected, "total"), 4),
+        "new_relevance_anchor": round(_score_value(selected, "relevance_anchor"), 4),
+        "new_evidence_signal": round(_score_value(selected, "evidence_signal"), 4),
+    }
+
+
+def _select_source_anchored_topic_repair_candidate(
+    *,
+    hard_gate_arm: str,
+    chosen: Dict[str, Any],
+    best_candidate_by_source: Dict[str, Dict[str, Any]],
+    feedback: Dict[str, Any],
+    rel_score: float,
+    rel_threshold: float,
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """Let a strong evidence arm repair topic when it preserves topic anchors.
+
+    Some relevance failures come from weak source grounding rather than missing
+    topic words. In those cases, a source/evidence repair can improve both
+    reference metrics and topic alignment better than a pure topic rewrite.
+    """
+    if hard_gate_arm != "defect_topic" or not chosen:
+        return None, {}
+    evidence = (best_candidate_by_source or {}).get("defect_evidence")
+    if not evidence:
+        return None, {}
+    source_check = feedback.get("source_check") if isinstance(feedback.get("source_check"), dict) else {}
+    if not bool(source_check.get("passed", False)):
+        return None, {}
+    source_alignment = feedback.get("source_alignment") if isinstance(feedback.get("source_alignment"), dict) else {}
+    source_alignment_count = int(source_alignment.get("source_count", 0) or 0)
+    source_alignment_score = _coerce_float(source_alignment.get("score"), 1.0)
+    alignment_floor = float(os.getenv("CONTROLLER_SOURCE_ANCHORED_TOPIC_ALIGNMENT_FLOOR", "0.45"))
+    if source_alignment_count <= 0 or source_alignment_score >= alignment_floor:
+        return None, {}
+    failed_dims = feedback.get("quality_dimensions_failed") if isinstance(feedback.get("quality_dimensions_failed"), list) else []
+    if failed_dims:
+        return None, {}
+    if feedback.get("quality_score_passed") is False:
+        return None, {}
+
+    chosen_rel = _score_value(chosen, "relevance_anchor")
+    evidence_rel = _score_value(evidence, "relevance_anchor")
+    chosen_total = _score_value(chosen, "total")
+    evidence_total = _score_value(evidence, "total")
+    min_relevance = float(os.getenv("CONTROLLER_SOURCE_ANCHORED_TOPIC_MIN_RELEVANCE", "0.94"))
+    relevance_slack = float(os.getenv("CONTROLLER_SOURCE_ANCHORED_TOPIC_RELEVANCE_SLACK", "0.015"))
+    min_evidence_signal = float(os.getenv("CONTROLLER_SOURCE_ANCHORED_TOPIC_MIN_EVIDENCE_SIGNAL", "0.82"))
+    total_slack = float(os.getenv("CONTROLLER_SOURCE_ANCHORED_TOPIC_TOTAL_SLACK", "0.04"))
+    if (
+        evidence_rel >= min_relevance
+        and evidence_rel >= chosen_rel - relevance_slack
+        and _score_value(evidence, "evidence_signal") >= min_evidence_signal
+        and evidence_total >= chosen_total - total_slack
+    ):
+        rel_gap = max(0.0, float(rel_threshold or 0.0) - float(rel_score or 0.0))
+        return evidence, {
+            "reason": "source_anchored_topic_repair",
+            "hard_gate_arm": hard_gate_arm,
+            "previous_arm": str(chosen.get("source", "")),
+            "new_arm": str(evidence.get("source", "")),
+            "rel_gap": round(rel_gap, 4),
+            "source_alignment_score": round(source_alignment_score, 4),
+            "alignment_floor": round(alignment_floor, 4),
+            "previous_relevance_anchor": round(chosen_rel, 4),
+            "new_relevance_anchor": round(evidence_rel, 4),
+            "new_evidence_signal": round(_score_value(evidence, "evidence_signal"), 4),
+        }
+    return None, {}
+
+
+def _should_soften_hard_gate_for_aligned_candidate(
+    *,
+    hard_gate_arm: str,
+    chosen_source: str,
+    chosen: Dict[str, Any],
+    defect_graph: Dict[str, float],
+    alignment_override: Dict[str, Any],
+) -> bool:
+    if str(hard_gate_arm or "") != "defect_topic":
+        return False
+    if str(chosen_source or "") != "defect_evidence":
+        return False
+    if not isinstance(alignment_override, dict) or alignment_override.get("reason") != "multi_defect_pareto_alignment":
+        return False
+    if str(alignment_override.get("previous_arm") or "") != hard_gate_arm:
+        return False
+    if str(alignment_override.get("new_arm") or "") != chosen_source:
+        return False
+    score = chosen.get("score", {}) if isinstance(chosen.get("score"), dict) else {}
+    if float(score.get("relevance_anchor", 0.0) or 0.0) < float(os.getenv("CONTROLLER_HARD_GATE_SOFTEN_RELEVANCE_ANCHOR", "0.95")):
+        return False
+    if float(score.get("evidence_signal", 0.0) or 0.0) < float(os.getenv("CONTROLLER_HARD_GATE_SOFTEN_EVIDENCE_SIGNAL", "0.75")):
+        return False
+    if max(
+        float(defect_graph.get("evidence", 0.0) or 0.0),
+        float(defect_graph.get("source_alignment", 0.0) or 0.0),
+    ) < float(os.getenv("CONTROLLER_HARD_GATE_SOFTEN_EVIDENCE_DEFECT", "0.08")):
+        return False
+    previous_utility = float(alignment_override.get("previous_utility", 0.0) or 0.0)
+    new_utility = float(alignment_override.get("new_utility", 0.0) or 0.0)
+    return new_utility >= previous_utility + float(os.getenv("CONTROLLER_HARD_GATE_SOFTEN_MIN_UTILITY_GAIN", "0.03"))
+
+
+def _select_topic_hard_gate_no_harm_evidence_candidate(
+    *,
+    hard_gate_arm: str,
+    topic_candidate: Optional[Dict[str, Any]],
+    evidence_candidate: Optional[Dict[str, Any]],
+    defect_graph: Dict[str, float],
+    feedback: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    if str(hard_gate_arm or "") != "defect_topic" or not topic_candidate or not evidence_candidate:
+        return None, {}
+    topic_score = topic_candidate.get("score", {}) if isinstance(topic_candidate.get("score"), dict) else {}
+    evidence_score = evidence_candidate.get("score", {}) if isinstance(evidence_candidate.get("score"), dict) else {}
+    topic_total = float(topic_score.get("total", 0.0) or 0.0)
+    evidence_total = float(evidence_score.get("total", 0.0) or 0.0)
+    close_margin = float(os.getenv("CONTROLLER_TOPIC_HARD_GATE_EVIDENCE_CLOSE_MARGIN", "0.035"))
+    if evidence_total < topic_total - close_margin:
+        return None, {}
+    topic_rel = float(topic_score.get("relevance_anchor", 0.0) or 0.0)
+    evidence_rel = float(evidence_score.get("relevance_anchor", 0.0) or 0.0)
+    rel_drop_max = float(os.getenv("CONTROLLER_TOPIC_HARD_GATE_EVIDENCE_MAX_REL_DROP", "0.025"))
+    if evidence_rel < topic_rel - rel_drop_max:
+        return None, {}
+    feedback = feedback if isinstance(feedback, dict) else {}
+    dimensions = feedback.get("quality_dimensions") if isinstance(feedback.get("quality_dimensions"), dict) else {}
+    checks = feedback.get("quality_dimensions_check") if isinstance(feedback.get("quality_dimensions_check"), dict) else {}
+
+    def dimension_confirmed(name: str, default_threshold: float) -> bool:
+        check = checks.get(name) if isinstance(checks.get(name), dict) else {}
+        value = float(dimensions.get(name, check.get("value", 0.0)) or 0.0)
+        threshold = float(check.get("threshold", default_threshold) or default_threshold)
+        return bool(check.get("passed", value >= threshold)) and value >= threshold + 0.08
+
+    semantic_topic_confirmed = (
+        dimension_confirmed("topic_alignment", 0.52)
+        and dimension_confirmed("coverage_completeness", 0.70)
+    )
+    if (
+        float(defect_graph.get("hard_relevance_gate", 0.0) or 0.0) > 0.0
+        and not semantic_topic_confirmed
+    ):
+        min_rel_gain = float(os.getenv("CONTROLLER_TOPIC_HARD_GATE_EVIDENCE_MIN_REL_GAIN", "0.02"))
+        if evidence_rel < topic_rel + min_rel_gain:
+            return None, {}
+    topic_evidence = float(topic_score.get("evidence_signal", 0.0) or 0.0)
+    evidence_signal = float(evidence_score.get("evidence_signal", 0.0) or 0.0)
+    min_evidence_gain = float(os.getenv("CONTROLLER_TOPIC_HARD_GATE_EVIDENCE_MIN_GAIN", "0.18"))
+    if evidence_signal < topic_evidence + min_evidence_gain:
+        return None, {}
+    topic_need = float(defect_graph.get("topic", 0.0) or 0.0)
+    coverage_need = float(defect_graph.get("coverage", 0.0) or 0.0)
+    evidence_need = max(
+        float(defect_graph.get("evidence", 0.0) or 0.0),
+        float(defect_graph.get("source_alignment", 0.0) or 0.0),
+    )
+    material_topic_gap = max(topic_need, coverage_need)
+    max_soft_topic_gap = float(os.getenv("CONTROLLER_TOPIC_HARD_GATE_EVIDENCE_MAX_TOPIC_GAP", "0.16"))
+    evidence_dominance_margin = float(os.getenv("CONTROLLER_TOPIC_HARD_GATE_EVIDENCE_DOMINANCE_MARGIN", "0.34"))
+    if material_topic_gap > max_soft_topic_gap and not semantic_topic_confirmed:
+        evidence_dominates = evidence_need >= material_topic_gap + evidence_dominance_margin
+        no_topic_anchor_loss = evidence_rel >= topic_rel - min(0.005, rel_drop_max)
+        if not (evidence_dominates and no_topic_anchor_loss and evidence_signal >= 0.92):
+            return None, {}
+    # Keep the hard topic gate strict for catastrophic topic failures unless
+    # the evidence candidate is both close in total score and much safer for
+    # source/evidence preservation.
+    catastrophic_topic_gap = float(os.getenv("CONTROLLER_TOPIC_HARD_GATE_CATASTROPHIC_TOPIC", "0.92"))
+    if topic_need >= catastrophic_topic_gap and evidence_need < 0.08 and evidence_signal < 0.85:
+        return None, {}
+    return evidence_candidate, {
+        "reason": (
+            "semantic_topic_confirmed_evidence_repair"
+            if semantic_topic_confirmed
+            else "topic_hard_gate_no_harm_evidence"
+        ),
+        "hard_gate_arm": hard_gate_arm,
+        "previous_arm": "defect_topic",
+        "new_arm": "defect_evidence",
+        "semantic_topic_confirmed": semantic_topic_confirmed,
+        "topic_total": round(topic_total, 4),
+        "evidence_total": round(evidence_total, 4),
+        "topic_relevance_anchor": round(topic_rel, 4),
+        "evidence_relevance_anchor": round(evidence_rel, 4),
+        "topic_evidence_signal": round(topic_evidence, 4),
+        "evidence_signal": round(evidence_signal, 4),
+        "topic_need": round(topic_need, 4),
+        "evidence_need": round(evidence_need, 4),
+        "margin": round(close_margin, 4),
+    }
+
+
+def _select_defect_aligned_candidate(
+    chosen: Dict[str, Any],
+    best_candidate_by_source: Dict[str, Dict[str, Any]],
+    defect_graph: Dict[str, float],
+    failed_dims: List[str],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Prefer a candidate aligned with the complete verifier defect profile.
+
+    Bandit history, exploration, and cooldown are useful, but they should not
+    select a repair that ignores the actual verifier diagnosis. Multi-defect
+    cases are scored as a Pareto problem before the dominant-defect fallback,
+    so repairing coherence cannot silently discard evidence grounding.
+    """
+    if not chosen or not best_candidate_by_source:
+        return chosen, {}
+
+    failed = {str(x) for x in failed_dims or []}
+    defect_values = {
+        "topic": float(defect_graph.get("topic", 0.0) or 0.0),
+        "evidence": float(defect_graph.get("evidence", 0.0) or 0.0),
+        "novelty": max(
+            float(defect_graph.get("novelty", 0.0) or 0.0),
+            float(defect_graph.get("redundancy", 0.0) or 0.0),
+        ),
+        "structure": float(defect_graph.get("structure", 0.0) or 0.0),
+        "coherence": float(defect_graph.get("coherence", 0.0) or 0.0),
+    }
+    if "topic_alignment" in failed or "coverage_completeness" in failed:
+        defect_values["topic"] = max(defect_values["topic"], 0.12)
+    if "evidence_grounding" in failed:
+        defect_values["evidence"] = max(defect_values["evidence"], 0.12)
+    if "novelty" in failed:
+        defect_values["novelty"] = max(defect_values["novelty"], 0.12)
+    if "structure_clarity" in failed:
+        defect_values["structure"] = max(defect_values["structure"], 0.12)
+    if "logical_coherence" in failed:
+        defect_values["coherence"] = max(defect_values["coherence"], 0.12)
+
+    metric_for_defect = {
+        "topic": "relevance_anchor",
+        "evidence": "evidence_signal",
+        "novelty": "novelty",
+        "structure": "structure",
+        "coherence": "coherence_signal",
+    }
+    if "logical_coherence" in failed:
+        evidence_need = max(
+            defect_values["evidence"],
+            float(defect_graph.get("source_alignment", 0.0) or 0.0),
+        )
+        severe_evidence_failure = (
+            "evidence_grounding" in failed
+            or evidence_need >= float(os.getenv("CONTROLLER_HARD_COHERENCE_SEVERE_EVIDENCE_MIN", "0.55"))
+        )
+        if not severe_evidence_failure:
+            chosen_coherence = _score_value(chosen, "coherence_signal")
+            chosen_evidence = _score_value(chosen, "evidence_signal")
+            chosen_relevance = _score_value(chosen, "relevance_anchor")
+            relevance_floor = float(os.getenv("CONTROLLER_HARD_COHERENCE_RELEVANCE_FLOOR", "0.90"))
+            coherence_gain = float(os.getenv("CONTROLLER_HARD_COHERENCE_MIN_GAIN", "0.08"))
+            evidence_slack = float(os.getenv("CONTROLLER_HARD_COHERENCE_EVIDENCE_SLACK", "0.18"))
+            structure_candidates = [
+                candidate
+                for source in ("rule_structured", "defect_structure")
+                for candidate in [best_candidate_by_source.get(source)]
+                if candidate
+                and _score_value(candidate, "relevance_anchor") >= min(relevance_floor, chosen_relevance)
+                and _score_value(candidate, "coherence_signal") >= chosen_coherence + coherence_gain
+                and _score_value(candidate, "evidence_signal") >= chosen_evidence - evidence_slack
+            ]
+            if structure_candidates:
+                hard_coherence_candidate = max(
+                    structure_candidates,
+                    key=lambda candidate: (
+                        _score_value(candidate, "coherence_signal"),
+                        _score_value(candidate, "structure"),
+                        _score_value(candidate, "total"),
+                    ),
+                )
+                if str(hard_coherence_candidate.get("source", "")) != str(chosen.get("source", "")):
+                    return hard_coherence_candidate, {
+                        "reason": "hard_coherence_defect_alignment",
+                        "previous_arm": str(chosen.get("source", "")),
+                        "new_arm": str(hard_coherence_candidate.get("source", "")),
+                        "previous_coherence": round(chosen_coherence, 4),
+                        "new_coherence": round(_score_value(hard_coherence_candidate, "coherence_signal"), 4),
+                        "evidence_need": round(evidence_need, 4),
+                        "evidence_slack": evidence_slack,
+                    }
+
+    active_defects = {
+        defect: value
+        for defect, value in defect_values.items()
+        if value >= float(os.getenv("CONTROLLER_MULTI_DEFECT_ACTIVE_MIN", "0.08"))
+    }
+    if len(active_defects) >= 2:
+        weight_total = sum(active_defects.values()) or 1.0
+        normalized_weights = {
+            defect: value / weight_total for defect, value in active_defects.items()
+        }
+        relevance_floor = float(os.getenv("CONTROLLER_MULTI_DEFECT_RELEVANCE_FLOOR", "0.90"))
+        metric_floor = float(os.getenv("CONTROLLER_MULTI_DEFECT_METRIC_FLOOR", "0.30"))
+        total_weight = float(os.getenv("CONTROLLER_MULTI_DEFECT_TOTAL_WEIGHT", "0.20"))
+
+        def multi_defect_utility(candidate: Dict[str, Any]) -> float:
+            aligned = sum(
+                weight * _score_value(candidate, metric_for_defect[defect])
+                for defect, weight in normalized_weights.items()
+            )
+            return aligned + total_weight * _score_value(candidate, "total")
+
+        eligible = [
+            candidate
+            for candidate in best_candidate_by_source.values()
+            if (
+                _score_value(candidate, "relevance_anchor") >= relevance_floor
+                and all(
+                    _score_value(candidate, metric_for_defect[defect]) >= metric_floor
+                    for defect in active_defects
+                )
+            )
+        ]
+        if eligible:
+            pareto_candidate = max(
+                eligible,
+                key=lambda candidate: (
+                    multi_defect_utility(candidate),
+                    _score_value(candidate, "total"),
+                    _score_value(candidate, "evidence_signal"),
+                    _score_value(candidate, "novelty"),
+                ),
+            )
+            chosen_utility = multi_defect_utility(chosen)
+            pareto_utility = multi_defect_utility(pareto_candidate)
+            utility_margin = float(os.getenv("CONTROLLER_MULTI_DEFECT_UTILITY_MARGIN", "0.015"))
+            if (
+                str(pareto_candidate.get("source", "")) != str(chosen.get("source", ""))
+                and pareto_utility >= chosen_utility + utility_margin
+            ):
+                return pareto_candidate, {
+                    "reason": "multi_defect_pareto_alignment",
+                    "active_defects": {
+                        defect: round(value, 4) for defect, value in active_defects.items()
+                    },
+                    "previous_arm": str(chosen.get("source", "")),
+                    "new_arm": str(pareto_candidate.get("source", "")),
+                    "previous_utility": round(chosen_utility, 4),
+                    "new_utility": round(pareto_utility, 4),
+                    "utility_margin": utility_margin,
+                }
+
+    dominant_defect, dominant_value = max(defect_values.items(), key=lambda item: item[1])
+    if dominant_value < float(os.getenv("CONTROLLER_DOMINANT_DEFECT_MIN", "0.08")):
+        return chosen, {}
+
+    arm_for_defect = {
+        "topic": "defect_topic",
+        "evidence": "defect_evidence",
+        "novelty": "defect_novelty",
+        "structure": "defect_structure",
+        "coherence": "rule_structured",
+    }
+    target_arm = arm_for_defect.get(dominant_defect, "")
+    target = best_candidate_by_source.get(target_arm)
+    if not target:
+        return chosen, {}
+
+    chosen_source = str(chosen.get("source", ""))
+    chosen_total = _score_value(chosen, "total")
+    higher_total_margin = float(os.getenv("CONTROLLER_NO_HARM_HIGHER_TOTAL_MARGIN", "0.075"))
+    no_harm_relevance_slack = float(os.getenv("CONTROLLER_NO_HARM_RELEVANCE_SLACK", "0.030"))
+    no_harm_novelty_slack = float(os.getenv("CONTROLLER_NO_HARM_NOVELTY_SLACK", "0.025"))
+    no_harm_evidence_slack = float(os.getenv("CONTROLLER_NO_HARM_EVIDENCE_SLACK", "0.050"))
+    no_harm_structure_slack = float(os.getenv("CONTROLLER_NO_HARM_STRUCTURE_SLACK", "0.080"))
+    higher_total_candidates = [
+        cand
+        for cand in best_candidate_by_source.values()
+        if (
+            str(cand.get("source", "")).startswith("defect_")
+            and str(cand.get("source", "")) != chosen_source
+            and _score_value(cand, "total") >= chosen_total + higher_total_margin
+            and _score_value(cand, "relevance_anchor") >= _score_value(chosen, "relevance_anchor") - no_harm_relevance_slack
+            and _score_value(cand, "novelty") >= _score_value(chosen, "novelty") - no_harm_novelty_slack
+            and (
+                _score_value(cand, "evidence_signal") >= _score_value(chosen, "evidence_signal") - no_harm_evidence_slack
+                or _score_value(cand, "evidence_signal") >= 0.75
+            )
+            and _score_value(cand, "structure") >= _score_value(chosen, "structure") - no_harm_structure_slack
+        )
+    ]
+    if higher_total_candidates:
+        best_higher_total = max(
+            higher_total_candidates,
+            key=lambda cand: (
+                _score_value(cand, "total"),
+                _score_value(cand, metric_for_defect.get(dominant_defect, "total")),
+                _score_value(cand, "evidence_signal"),
+                _score_value(cand, "novelty"),
+            ),
+        )
+        return best_higher_total, {
+            "reason": "no_harm_higher_total_defect_arm",
+            "dominant_defect": dominant_defect,
+            "previous_arm": chosen_source,
+            "new_arm": str(best_higher_total.get("source", "")),
+            "previous_total": round(chosen_total, 4),
+            "new_total": round(_score_value(best_higher_total, "total"), 4),
+            "higher_total_margin": higher_total_margin,
+        }
+
+    if chosen_source == target_arm:
+        return chosen, {}
+
+    metric_name = metric_for_defect[dominant_defect]
+    chosen_metric = _score_value(chosen, metric_name)
+    target_metric = _score_value(target, metric_name)
+    target_total = _score_value(target, "total")
+    metric_slack = float(os.getenv("CONTROLLER_OFF_DEFECT_METRIC_SLACK", "0.012"))
+    total_slack = float(os.getenv("CONTROLLER_DEFECT_ALIGNMENT_TOTAL_SLACK", "0.075"))
+    hard_gate_alignment = (
+        (dominant_defect == "topic" and float(defect_graph.get("hard_relevance_gate", 0.0) or 0.0) > 0.0)
+        or (dominant_defect == "novelty" and float(defect_graph.get("hard_redundancy_gate", 0.0) or 0.0) > 0.0)
+    )
+
+    hard_gate_metric_slack = max(
+        metric_slack,
+        float(os.getenv("CONTROLLER_HARD_GATE_METRIC_SLACK", "0.05")),
+    )
+    if hard_gate_alignment and dominant_defect == "topic" and chosen_source == "defect_evidence":
+        keep_margin = float(os.getenv("CONTROLLER_HARD_GATE_KEEP_HIGHER_TOTAL_EVIDENCE_MARGIN", "0.075"))
+        evidence_need = max(
+            float(defect_graph.get("evidence", 0.0) or 0.0),
+            float(defect_graph.get("source_alignment", 0.0) or 0.0),
+        )
+        evidence_active_min = float(os.getenv("CONTROLLER_HARD_GATE_KEEP_EVIDENCE_ACTIVE_MIN", "0.08"))
+        min_evidence_signal = float(os.getenv("CONTROLLER_HARD_GATE_KEEP_EVIDENCE_SIGNAL", "0.75"))
+        if (
+            evidence_need >= evidence_active_min
+            and chosen_total >= target_total + keep_margin
+            and chosen_metric >= target_metric - hard_gate_metric_slack
+            and _score_value(chosen, "evidence_signal") >= min_evidence_signal
+        ):
+            return chosen, {}
+    if hard_gate_alignment and target_metric >= chosen_metric - hard_gate_metric_slack:
+        return target, {
+            "reason": "hard_gate_defect_alignment",
+            "dominant_defect": dominant_defect,
+            "target_arm": target_arm,
+            "previous_arm": chosen_source,
+            "previous_total": round(chosen_total, 4),
+            "target_total": round(target_total, 4),
+            "metric": metric_name,
+            "previous_metric": round(chosen_metric, 4),
+            "target_metric": round(target_metric, 4),
+        }
+
+    if (
+        dominant_defect == "novelty"
+        and chosen_source == "defect_evidence"
+        and _score_value(chosen, "evidence_signal") >= 0.75
+        and chosen_metric >= target_metric - metric_slack
+        and chosen_total >= target_total + float(os.getenv("CONTROLLER_OFF_DEFECT_TOTAL_ADVANTAGE", "0.02"))
+    ):
+        return chosen, {}
+
+    if target_metric >= chosen_metric - metric_slack and target_total >= chosen_total - total_slack:
+        return target, {
+            "reason": "dominant_defect_alignment",
+            "dominant_defect": dominant_defect,
+            "target_arm": target_arm,
+            "previous_arm": chosen_source,
+            "previous_total": round(chosen_total, 4),
+            "target_total": round(target_total, 4),
+            "metric": metric_name,
+            "previous_metric": round(chosen_metric, 4),
+            "target_metric": round(target_metric, 4),
+        }
+
+    return chosen, {}
+
+
 # ============ API 数据模型 ============
 
 class RefinePromptRequest(BaseModel):
@@ -1049,6 +2053,268 @@ class ImproveOutlineRequest(BaseModel):
     document_id: Optional[str] = None
     section_id: Optional[str] = None
     subsection_id: Optional[str] = None
+    # Per-request experiment controls. The controller normally reads these from
+    # its service environment, but local benchmarks run multiple variants
+    # against one long-lived service process, so the caller must be able to
+    # override them without restarting the service between rows.
+    controller_bandit_enabled: Optional[bool] = None
+    controller_fixed_arm: Optional[str] = None
+    controller_no_bandit_allow_llm: Optional[bool] = None
+    # Arms proven ineffective by a real regenerate-and-verify cycle in the
+    # current subsection. This is request-local and must not leak to another
+    # subsection or become a topic-specific permanent ban.
+    controller_excluded_arms: List[str] = []
+
+
+class BanditOutcomeRequest(BaseModel):
+    selected_arm: str
+    feature_vector: List[float]
+    before_verification: Dict[str, Any]
+    after_verification: Dict[str, Any]
+    predicted_exploit: float = 0.0
+    proposal_reward: float = 0.0
+    application_accepted: bool = True
+    document_id: Optional[str] = None
+    section_id: Optional[str] = None
+    subsection_id: Optional[str] = None
+
+
+def _verification_outcome_utility(verification: Dict[str, Any]) -> float:
+    dimensions = verification.get("quality_dimensions")
+    if not isinstance(dimensions, dict):
+        dimensions = {}
+    dim_values = [
+        _clip01(float(value or 0.0))
+        for value in dimensions.values()
+        if isinstance(value, (int, float))
+    ]
+    dim_mean = sum(dim_values) / max(1, len(dim_values))
+    source_check = verification.get("source_check")
+    source_passed = bool(source_check.get("passed", False)) if isinstance(source_check, dict) else False
+    return _clip01(
+        0.22 * _clip01(float(verification.get("relevancy_index", 0.0) or 0.0))
+        + 0.12 * (1.0 - _clip01(_coerce_float(verification.get("redundancy_index"), 1.0)))
+        + 0.22 * _clip01(float(verification.get("quality_score", 0.0) or 0.0))
+        + 0.24 * dim_mean
+        + 0.12 * (1.0 if source_passed else 0.0)
+        + 0.08 * (1.0 if verification.get("is_passed", False) else 0.0)
+    )
+
+
+def _source_alignment_outcome_gain(before: Dict[str, Any], after: Dict[str, Any]) -> float:
+    """Reward evidence repairs that make retrieved sources visibly usable.
+
+    The Verifier's evidence_grounding scalar can stay flat even when a repair
+    improves source term coverage and citation/source phrase alignment. Counting
+    that gain keeps the bandit policy aligned with FlowerNet's RAG contribution
+    instead of over-learning generic verifier-score changes.
+    """
+    before_alignment = before.get("source_alignment") if isinstance(before.get("source_alignment"), dict) else {}
+    after_alignment = after.get("source_alignment") if isinstance(after.get("source_alignment"), dict) else {}
+    if not before_alignment or not after_alignment:
+        return 0.0
+    if int(before_alignment.get("source_count", 0) or 0) <= 0 or int(after_alignment.get("source_count", 0) or 0) <= 0:
+        return 0.0
+    before_score = _coerce_float(before_alignment.get("score"), 0.0)
+    after_score = _coerce_float(after_alignment.get("score"), 0.0)
+    before_terms = _coerce_float(before_alignment.get("term_coverage"), before_score)
+    after_terms = _coerce_float(after_alignment.get("term_coverage"), after_score)
+    before_bigrams = _coerce_float(before_alignment.get("bigram_overlap"), before_score)
+    after_bigrams = _coerce_float(after_alignment.get("bigram_overlap"), after_score)
+    before_task_phrases = _coerce_float(before_alignment.get("topic_phrase_coverage"), before_score)
+    after_task_phrases = _coerce_float(after_alignment.get("topic_phrase_coverage"), after_score)
+    return round(
+        _clip01(
+            0.45 * max(0.0, after_score - before_score)
+            + 0.25 * max(0.0, after_terms - before_terms)
+            + 0.15 * max(0.0, after_bigrams - before_bigrams)
+            + 0.15 * max(0.0, after_task_phrases - before_task_phrases)
+        ),
+        6,
+    )
+
+
+def _reviewer_score_map(verification: Dict[str, Any]) -> Dict[str, float]:
+    reviewer = verification.get("reviewer_assessment") if isinstance(verification.get("reviewer_assessment"), dict) else {}
+    dims = reviewer.get("reviewer_dimensions") if isinstance(reviewer.get("reviewer_dimensions"), dict) else {}
+    scores: Dict[str, float] = {}
+    for name, payload in dims.items():
+        if isinstance(payload, dict):
+            scores[str(name)] = _clip01(_coerce_float(payload.get("score"), 0.0))
+    return scores
+
+
+def _external_metric_proxy(verification: Dict[str, Any]) -> Optional[float]:
+    reviewer = verification.get("reviewer_assessment") if isinstance(verification.get("reviewer_assessment"), dict) else {}
+    alignment = reviewer.get("external_alignment") if isinstance(reviewer.get("external_alignment"), dict) else {}
+    if isinstance(alignment, dict) and alignment.get("available"):
+        return _clip01(_coerce_float(alignment.get("external_mean"), 0.0))
+    raw = verification.get("external_metrics") if isinstance(verification.get("external_metrics"), dict) else {}
+    vals = [
+        _clip01(_coerce_float(raw.get(key), 0.0))
+        for key in ("rouge1", "rouge2", "rougeL", "bertscore_f1")
+        if raw.get(key) is not None
+    ]
+    if vals:
+        return sum(vals) / len(vals)
+    return None
+
+
+def _controller_no_harm_gate(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]:
+    """Strict no-harm gate for external-metric-aligned controller outcomes."""
+    reviewer_tolerance = float(os.getenv("CONTROLLER_REVIEWER_NO_HARM_TOLERANCE", "0.025"))
+    external_tolerance = float(os.getenv("CONTROLLER_EXTERNAL_METRIC_NO_HARM_TOLERANCE", "0.015"))
+    readability_tolerance = float(os.getenv("CONTROLLER_READABILITY_NO_HARM_TOLERANCE", "0.025"))
+    grounding_tolerance = float(os.getenv("CONTROLLER_GROUNDING_NO_HARM_TOLERANCE", "0.02"))
+
+    before_scores = _reviewer_score_map(before)
+    after_scores = _reviewer_score_map(after)
+    protected_reviewer_dims = (
+        "citation_faithfulness",
+        "claim_support",
+        "logical_coherence",
+        "experimental_completeness",
+        "reproducibility_risk",
+    )
+    reviewer_regressions = {}
+    for name in protected_reviewer_dims:
+        if name in before_scores and name in after_scores:
+            delta = after_scores[name] - before_scores[name]
+            if delta < -reviewer_tolerance:
+                reviewer_regressions[name] = round(delta, 4)
+
+    before_external = _external_metric_proxy(before)
+    after_external = _external_metric_proxy(after)
+    external_metric_regression = (
+        before_external is not None
+        and after_external is not None
+        and after_external < before_external - external_tolerance
+    )
+
+    before_dims = before.get("quality_dimensions") if isinstance(before.get("quality_dimensions"), dict) else {}
+    after_dims = after.get("quality_dimensions") if isinstance(after.get("quality_dimensions"), dict) else {}
+    thresholds = after.get("dimension_thresholds") if isinstance(after.get("dimension_thresholds"), dict) else {}
+    readability_regression = False
+    for name in ("logical_coherence", "structure_clarity"):
+        if name in before_dims and name in after_dims:
+            before_value = _coerce_float(before_dims.get(name), 0.0)
+            after_value = _coerce_float(after_dims.get(name), 0.0)
+            threshold = _coerce_float(thresholds.get(name), 0.0)
+            still_safe = bool(
+                threshold > 0.0
+                and after_value >= threshold + float(os.getenv("CONTROLLER_READABILITY_SAFE_MARGIN", "0.08"))
+                and before_value - after_value < float(os.getenv("CONTROLLER_READABILITY_SEVERE_DROP", "0.10"))
+            )
+            if after_value < before_value - readability_tolerance and not still_safe:
+                readability_regression = True
+
+    evidence_grounding_regression = False
+    if "evidence_grounding" in before_dims and "evidence_grounding" in after_dims:
+        evidence_grounding_regression = (
+            _coerce_float(after_dims.get("evidence_grounding"), 0.0)
+            < _coerce_float(before_dims.get("evidence_grounding"), 0.0) - grounding_tolerance
+        )
+    before_source = before.get("source_check") if isinstance(before.get("source_check"), dict) else {}
+    after_source = after.get("source_check") if isinstance(after.get("source_check"), dict) else {}
+    false_citation_risk = bool(before_source.get("passed", False)) and not bool(after_source.get("passed", False))
+
+    before_alignment = before.get("source_alignment") if isinstance(before.get("source_alignment"), dict) else {}
+    after_alignment = after.get("source_alignment") if isinstance(after.get("source_alignment"), dict) else {}
+    source_alignment_regression = bool(
+        before_alignment.get("source_count", 0)
+        and after_alignment.get("source_count", 0)
+        and _coerce_float(after_alignment.get("score"), 0.0)
+        < _coerce_float(before_alignment.get("score"), 0.0) - grounding_tolerance
+    )
+
+    passed = not any(
+        [
+            reviewer_regressions,
+            external_metric_regression,
+            readability_regression,
+            evidence_grounding_regression,
+            false_citation_risk,
+            source_alignment_regression,
+        ]
+    )
+    return {
+        "passed": bool(passed),
+        "reviewer_regressions": reviewer_regressions,
+        "external_metric_regression": bool(external_metric_regression),
+        "readability_regression": bool(readability_regression),
+        "evidence_grounding_regression": bool(evidence_grounding_regression),
+        "source_alignment_regression": bool(source_alignment_regression),
+        "false_citation_risk": bool(false_citation_risk),
+        "before_external_metric_proxy": None if before_external is None else round(before_external, 4),
+        "after_external_metric_proxy": None if after_external is None else round(after_external, 4),
+    }
+
+
+def _controller_proposal_reward_quality(
+    *,
+    chosen_source: str,
+    score_gain: float,
+    rel_anchor_gain: float,
+    novelty_gain: float,
+    structure_gain: float,
+    evidence_gain: float,
+    defect_graph: Dict[str, float],
+) -> float:
+    """Estimate proposal reward with arm-target alignment.
+
+    Proposal scoring happens before the next real Verifier observation, so it
+    must be conservative. Generic outline improvements should not teach an
+    evidence arm that it succeeded unless the evidence/source target also
+    improved; otherwise full can over-repair while simpler ablations stay
+    closer to the stronger draft.
+    """
+    source = str(chosen_source or "")
+    defect_graph = defect_graph or {}
+    base = _clip01(
+        max(0.0, score_gain) * 0.38
+        + max(0.0, rel_anchor_gain) * 0.16
+        + max(0.0, novelty_gain) * 0.12
+        + max(0.0, structure_gain) * 0.10
+        + max(0.0, evidence_gain) * 0.24
+    )
+
+    if source in {"defect_evidence", "claim_evidence_repair", "citation_grounding_repair", "external_metric_repair", "reproducibility_repair"}:
+        target = max(0.0, evidence_gain)
+        source_need = max(
+            float(defect_graph.get("evidence", 0.0) or 0.0),
+            float(defect_graph.get("source_alignment", 0.0) or 0.0),
+            float(defect_graph.get("claim_evidence", 0.0) or 0.0),
+            float(defect_graph.get("citation_grounding", 0.0) or 0.0),
+            float(defect_graph.get("external_metric", 0.0) or 0.0) * 0.5,
+            float(defect_graph.get("reproducibility", 0.0) or 0.0) * 0.5,
+        )
+        if source_need >= 0.12 and target < float(os.getenv("CONTROLLER_PROPOSAL_MIN_EVIDENCE_TARGET_GAIN", "0.03")):
+            return _clip01(min(base * 0.25, 0.08))
+        return _clip01(0.45 * base + 0.55 * min(1.0, target * 2.2))
+
+    if source == "defect_topic":
+        target = max(0.0, rel_anchor_gain, score_gain * 0.35)
+        topic_need = float(defect_graph.get("topic", 0.0) or 0.0)
+        if topic_need >= 0.12 and target < float(os.getenv("CONTROLLER_PROPOSAL_MIN_TOPIC_TARGET_GAIN", "0.02")):
+            return _clip01(min(base * 0.35, 0.10))
+        return _clip01(0.60 * base + 0.40 * min(1.0, target * 1.8))
+
+    if source in {"defect_novelty", "novelty_repair"}:
+        target = max(0.0, novelty_gain)
+        novelty_need = max(
+            float(defect_graph.get("novelty", 0.0) or 0.0),
+            float(defect_graph.get("redundancy", 0.0) or 0.0),
+            float(defect_graph.get("novelty_repair", 0.0) or 0.0),
+        )
+        if novelty_need >= 0.12 and target < float(os.getenv("CONTROLLER_PROPOSAL_MIN_NOVELTY_TARGET_GAIN", "0.02")):
+            return _clip01(min(base * 0.35, 0.10))
+        return _clip01(0.60 * base + 0.40 * min(1.0, target * 1.8))
+
+    if source in {"defect_structure", "rule_structured", "structure_readability_repair", "reviewer_risk_repair"}:
+        target = max(0.0, structure_gain)
+        return _clip01(0.62 * base + 0.38 * min(1.0, target * 1.7))
+
+    return base
 
 
 # ============ API 端点 ============
@@ -1072,6 +2338,184 @@ def read_root():
 def health_check():
     """Lightweight health endpoint for Render and upstream service probes."""
     return {"status": "ok", "service": "flowernet-controller"}
+
+
+@app.post("/bandit-outcome")
+async def record_bandit_outcome(req: BanditOutcomeRequest):
+    """Apply delayed reward from the next real Verifier observation."""
+    before = dict(req.before_verification or {})
+    after = dict(req.after_verification or {})
+    before_utility = _verification_outcome_utility(before)
+    after_utility = _verification_outcome_utility(after)
+    delta = after_utility - before_utility
+    no_harm_gate = _controller_no_harm_gate(before, after)
+
+    before_dims = before.get("quality_dimensions") if isinstance(before.get("quality_dimensions"), dict) else {}
+    after_dims = after.get("quality_dimensions") if isinstance(after.get("quality_dimensions"), dict) else {}
+    dimension_regression_tolerance = float(os.getenv("CONTROLLER_OUTCOME_DIMENSION_NO_HARM_TOLERANCE", "0.025"))
+    safe_margin = float(os.getenv("CONTROLLER_OUTCOME_DIMENSION_SAFE_MARGIN", "0.02"))
+    severe_drop = float(os.getenv("CONTROLLER_OUTCOME_DIMENSION_SEVERE_DROP", "0.10"))
+    thresholds = after.get("dimension_thresholds") if isinstance(after.get("dimension_thresholds"), dict) else {}
+    if not thresholds:
+        checks = after.get("quality_dimensions_check") if isinstance(after.get("quality_dimensions_check"), dict) else {}
+        thresholds = {
+            key: value.get("threshold")
+            for key, value in checks.items()
+            if isinstance(value, dict) and value.get("threshold") is not None
+        }
+    dimension_regressions = {}
+    for key, value in before_dims.items():
+        if key not in after_dims:
+            continue
+        before_value = float(value or 0.0)
+        after_value = float(after_dims.get(key, 0.0) or 0.0)
+        drop = after_value - before_value
+        if drop >= -dimension_regression_tolerance:
+            continue
+        threshold = _coerce_float(thresholds.get(key), 0.0) if isinstance(thresholds, dict) else 0.0
+        still_safe = bool(threshold > 0.0 and after_value >= threshold + safe_margin and abs(drop) < severe_drop)
+        if still_safe:
+            continue
+        dimension_regressions[key] = round(drop, 4)
+    before_source = before.get("source_check") if isinstance(before.get("source_check"), dict) else {}
+    after_source = after.get("source_check") if isinstance(after.get("source_check"), dict) else {}
+    before_alignment = before.get("source_alignment") if isinstance(before.get("source_alignment"), dict) else {}
+    after_alignment = after.get("source_alignment") if isinstance(after.get("source_alignment"), dict) else {}
+    redundancy_regression = _coerce_float(after.get("redundancy_index"), 1.0) > _coerce_float(before.get("redundancy_index"), 1.0) + 0.015
+    source_alignment_regression = bool(
+        before_alignment.get("source_count", 0)
+        and after_alignment.get("source_count", 0)
+        and float(after_alignment.get("score", 0.0) or 0.0) < float(before_alignment.get("score", 0.0) or 0.0) - 0.02
+    )
+    task_phrase_regression = bool(
+        before_alignment.get("source_count", 0)
+        and after_alignment.get("source_count", 0)
+        and _coerce_float(after_alignment.get("topic_phrase_coverage"), 0.0)
+        < _coerce_float(before_alignment.get("topic_phrase_coverage"), 0.0)
+        - float(os.getenv("CONTROLLER_OUTCOME_TASK_PHRASE_NO_HARM_TOLERANCE", "0.06"))
+    )
+    regressed = bool(
+        dimension_regressions
+        or float(after.get("relevancy_index", 0.0) or 0.0) < float(before.get("relevancy_index", 0.0) or 0.0) - 0.015
+        or float(after.get("quality_score", 0.0) or 0.0) < float(before.get("quality_score", 0.0) or 0.0) - 0.02
+        or redundancy_regression
+        or source_alignment_regression
+        or task_phrase_regression
+        or (bool(before_source.get("passed", False)) and not bool(after_source.get("passed", False)))
+        or not bool(no_harm_gate.get("passed", True))
+    )
+    arm_targets = {
+        "defect_evidence": ("evidence_grounding",),
+        "defect_novelty": ("novelty",),
+        "defect_topic": ("topic_alignment",),
+        "defect_structure": ("structure_clarity", "logical_coherence"),
+        "rule_structured": ("structure_clarity", "logical_coherence"),
+        "novelty_repair": ("novelty",),
+        "claim_evidence_repair": ("evidence_grounding",),
+        "citation_grounding_repair": ("evidence_grounding",),
+        "external_metric_repair": ("evidence_grounding", "topic_alignment", "novelty"),
+        "reviewer_risk_repair": ("evidence_grounding", "logical_coherence", "novelty"),
+        "structure_readability_repair": ("structure_clarity", "logical_coherence"),
+        "reproducibility_repair": ("evidence_grounding",),
+    }
+    target_gains = [
+        float(after_dims.get(name, 0.0) or 0.0) - float(before_dims.get(name, 0.0) or 0.0)
+        for name in arm_targets.get(req.selected_arm, tuple(before_dims))
+        if name in before_dims and name in after_dims
+    ]
+    if req.selected_arm in {"defect_novelty", "novelty_repair"}:
+        target_gains.append(
+            _coerce_float(before.get("redundancy_index"), 1.0)
+            - _coerce_float(after.get("redundancy_index"), 1.0)
+        )
+    if req.selected_arm == "defect_topic":
+        target_gains.append(
+            float(after.get("relevancy_index", 0.0) or 0.0)
+            - float(before.get("relevancy_index", 0.0) or 0.0)
+        )
+    source_alignment_gain = _source_alignment_outcome_gain(before, after)
+    if req.selected_arm in {"defect_evidence", "claim_evidence_repair", "citation_grounding_repair", "external_metric_repair", "reproducibility_repair"}:
+        target_gains.append(source_alignment_gain)
+    before_reviewer = _reviewer_score_map(before)
+    after_reviewer = _reviewer_score_map(after)
+    reviewer_targets = {
+        "claim_evidence_repair": ("claim_support",),
+        "citation_grounding_repair": ("citation_faithfulness",),
+        "reviewer_risk_repair": ("reviewer_concern_prediction",),
+        "structure_readability_repair": ("logical_coherence",),
+        "reproducibility_repair": ("reproducibility_risk", "experimental_completeness"),
+        "novelty_repair": ("novelty_strength",),
+    }
+    for reviewer_dim in reviewer_targets.get(req.selected_arm, ()):
+        if reviewer_dim in before_reviewer and reviewer_dim in after_reviewer:
+            target_gains.append(after_reviewer[reviewer_dim] - before_reviewer[reviewer_dim])
+    if req.selected_arm == "external_metric_repair":
+        before_external = _external_metric_proxy(before)
+        after_external = _external_metric_proxy(after)
+        if before_external is not None and after_external is not None:
+            target_gains.append(after_external - before_external)
+    targeted_gain = max(target_gains, default=delta)
+    targeted_effective = targeted_gain >= float(os.getenv("CONTROLLER_OUTCOME_MIN_TARGET_GAIN", "0.01"))
+    pass_transition = bool(after.get("is_passed", False)) and not bool(before.get("is_passed", False))
+    effective = bool(req.application_accepted) and not regressed and targeted_effective and delta >= -0.002
+    reward = 0.0 if (regressed or not targeted_effective) else _clip01(max(0.0, delta) * 3.0 + min(0.25, targeted_gain) + (0.15 if pass_transition else 0.0))
+
+    feature_vector = [float(value or 0.0) for value in req.feature_vector]
+    with BANDIT_LOCK:
+        state = _load_bandit_state(len(feature_vector))
+        arm_state = (state.get("arms") or {}).get(req.selected_arm)
+        if not isinstance(arm_state, dict) or len(arm_state.get("weights") or []) != len(feature_vector):
+            raise HTTPException(status_code=422, detail="unknown arm or feature dimension mismatch")
+        selection_count = int(arm_state.get("count", 0) or 0)
+        _bandit_update(
+            state=state,
+            arm=req.selected_arm,
+            features=feature_vector,
+            reward=reward,
+            predicted_exploit=float(req.predicted_exploit or 0.0),
+            observed_latency=float(arm_state.get("avg_latency", 0.0) or 0.0),
+            observed_cost=float(arm_state.get("avg_cost", 0.0) or 0.0),
+            uncertainty_pressure=float(after.get("quality_overall_uncertainty", 0.0) or 0.0),
+            effective=effective,
+        )
+        arm_state["count"] = selection_count
+        arm_state["outcome_count"] = int(arm_state.get("outcome_count", 0) or 0) + 1
+        arm_state["realized_reward_ema"] = (
+            0.85 * float(arm_state.get("realized_reward_ema", reward) or 0.0) + 0.15 * reward
+        )
+        state["total_outcomes"] = int(state.get("total_outcomes", 0) or 0) + 1
+        drift_debug = _update_drift_and_maybe_reset(state=state, reward=reward)
+        _save_bandit_state(state)
+
+    event = {
+        "timestamp": time.time(),
+        "event_type": "realized_controller_outcome",
+        "chosen_arm": req.selected_arm,
+        "feature_vector": feature_vector,
+        "proposal_reward": round(float(req.proposal_reward or 0.0), 6),
+        "reward": round(float(reward), 6),
+        "effective": effective,
+        "application_accepted": bool(req.application_accepted),
+        "before_utility": round(before_utility, 6),
+        "after_utility": round(after_utility, 6),
+        "utility_delta": round(delta, 6),
+        "pass_transition": pass_transition,
+        "regressed": regressed,
+        "dimension_regressions": dimension_regressions,
+        "redundancy_regression": redundancy_regression,
+        "source_alignment_regression": source_alignment_regression,
+        "task_phrase_regression": task_phrase_regression,
+        "no_harm_gate": no_harm_gate,
+        "source_alignment_gain": round(source_alignment_gain, 6),
+        "targeted_gain": round(targeted_gain, 6),
+        "targeted_effective": targeted_effective,
+        "document_id": req.document_id,
+        "section_id": req.section_id,
+        "subsection_id": req.subsection_id,
+        "drift_debug": drift_debug,
+    }
+    _append_ope_event(event)
+    return {"success": True, **event}
 
 
 @app.post("/refine_prompt")
@@ -1161,6 +2605,12 @@ async def improve_outline(req: ImproveOutlineRequest):
         )
         working_outline = _sanitize_outline_text(db_outline if db_outline else req.current_outline)
         original_outline = _sanitize_outline_text(req.original_outline) or working_outline
+        english_repair = _prefers_english_repair_text(
+            original_outline,
+            working_outline,
+            req.failed_draft,
+            str(req.feedback.get("feedback", "") or ""),
+        )
 
         # 构建历史上下文（已通过小节的摘要，供去重指导）
         history_context = ""
@@ -1230,8 +2680,8 @@ async def improve_outline(req: ImproveOutlineRequest):
         llm_error = ""
         use_llm_outline = os.getenv("CONTROLLER_USE_LLM_OUTLINE", "true").lower() == "true"
         require_llm_source = os.getenv("CONTROLLER_REQUIRE_LLM_SOURCE", "false").lower() == "true"
-        llm_timeout = max(20, int(os.getenv("CONTROLLER_LLM_TIMEOUT", "90")))
-        llm_retries = max(1, int(os.getenv("CONTROLLER_LLM_RETRIES", "3")))
+        llm_timeout = max(20, int(os.getenv("CONTROLLER_LLM_TIMEOUT", "60")))
+        llm_retries = max(1, int(os.getenv("CONTROLLER_LLM_RETRIES", "2")))
         llm_call_mode = os.getenv("CONTROLLER_LLM_CALL_MODE", "direct").strip().lower()
         llm_fallback_to_generator = os.getenv("CONTROLLER_LLM_FALLBACK_TO_GENERATOR", "true").lower() == "true"
 
@@ -1282,50 +2732,100 @@ async def improve_outline(req: ImproveOutlineRequest):
         fallback_lines = [working_outline or original_outline]
         if rel_score < rel_threshold:
             fallback_lines.append(
-                "补充要求：开头先定义本小节核心结论，再按要点展开，每段都要与本小节主题直接对应。"
+                "Additional requirement: begin with the subsection's core claim, then develop outline points; every paragraph must directly match the subsection topic."
+                if english_repair
+                else "补充要求：开头先定义本小节核心结论，再按要点展开，每段都要与本小节主题直接对应。"
             )
             if missing_anchor_terms:
-                fallback_lines.append("补充要求：必须覆盖关键词：" + "、".join(missing_anchor_terms) + "。")
+                fallback_lines.append(
+                    "Additional requirement: cover these keywords naturally: " + ", ".join(missing_anchor_terms) + "."
+                    if english_repair
+                    else "补充要求：必须覆盖关键词：" + "、".join(missing_anchor_terms) + "。"
+                )
         if red_score > red_threshold:
             fallback_lines.append(
-                "补充要求：避免复述前文已有信息，改写为新的事实、案例或角度。"
+                "Additional requirement: avoid restating prior content; replace repeated material with new facts, cases, mechanisms, or analytical angles."
+                if english_repair
+                else "补充要求：避免复述前文已有信息，改写为新的事实、案例或角度。"
             )
             if repeated_terms:
-                fallback_lines.append("补充要求：避免重复这些已出现词：" + "、".join(repeated_terms) + "。")
+                fallback_lines.append(
+                    "Additional requirement: avoid repeating these already-used terms: " + ", ".join(repeated_terms) + "."
+                    if english_repair
+                    else "补充要求：避免重复这些已出现词：" + "、".join(repeated_terms) + "。"
+                )
         if missing_terms:
-            fallback_lines.append("Targeted Expansion Plan：必须把这些缺失主题词转化为具体论点：" + "、".join(missing_terms) + "。")
+            fallback_lines.append(
+                "Targeted Expansion Plan: turn these missing topic terms into concrete claims: " + ", ".join(missing_terms) + "."
+                if english_repair
+                else "Targeted Expansion Plan：必须把这些缺失主题词转化为具体论点：" + "、".join(missing_terms) + "。"
+            )
         if missing_aspects:
-            fallback_lines.append("Targeted Expansion Plan：必须补齐这些内容面向：" + "、".join(missing_aspects) + "。")
+            fallback_lines.append(
+                "Targeted Expansion Plan: complete these missing content aspects: " + ", ".join(missing_aspects) + "."
+                if english_repair
+                else "Targeted Expansion Plan：必须补齐这些内容面向：" + "、".join(missing_aspects) + "。"
+            )
         if missing_evidence_types:
-            fallback_lines.append("Evidence Plan：必须补齐这些证据类型：" + "、".join(missing_evidence_types) + "。")
+            fallback_lines.append(
+                "Evidence Plan: add these missing evidence types: " + ", ".join(missing_evidence_types) + "."
+                if english_repair
+                else "Evidence Plan：必须补齐这些证据类型：" + "、".join(missing_evidence_types) + "。"
+            )
         if "偏离主题" in feedback_text or rel_score < 0.5:
             fallback_lines.append(
-                "补充要求：删除泛泛背景描述，只保留与当前大纲要点直接相关的内容。"
+                "Additional requirement: remove generic background and keep only content directly tied to the current outline points."
+                if english_repair
+                else "补充要求：删除泛泛背景描述，只保留与当前大纲要点直接相关的内容。"
             )
         rule_outline = _sanitize_outline_text("\n".join([line for line in fallback_lines if line and line.strip()]))
 
-        structured_blocks = [
-            "【改纲版本】第{}轮结构化修订".format(iteration),
-            "【核心主题】" + (original_outline[:240] if original_outline else "请紧扣当前小节主题"),
-            "【写作结构】",
-            "1) 先给出本小节的核心定义/结论（1-2句）",
-            "2) 再按 3-5 个要点展开，每个要点必须直接支撑主题",
-            "3) 结尾用 1 段总结该小节新增信息，不复述前文",
-        ]
-        if missing_anchor_terms:
-            structured_blocks.append("【必写关键词】" + "、".join(missing_anchor_terms))
-        if missing_terms:
-            structured_blocks.append("【缺失主题词扩写】" + "、".join(missing_terms))
-        if missing_aspects:
-            structured_blocks.append("【必须补齐的内容面向】" + "、".join(missing_aspects))
-        if repeated_terms:
-            structured_blocks.append("【禁止重复词】" + "、".join(repeated_terms))
-        if red_score > red_threshold:
-            structured_blocks.append("【差异化要求】每个要点至少包含一个新的事实、案例、数据或机制说明。")
-        structured_blocks.append("【专业编辑要求】不要只增加格式；每一处修改都必须带来新的主题信息、证据或推理。")
-        if feedback_text:
-            structured_blocks.append("【Verifier反馈约束】" + feedback_text[:180])
-        structured_blocks.append("【质量阈值】relevancy >= {:.2f}, redundancy <= {:.2f}".format(rel_threshold, red_threshold))
+        if english_repair:
+            structured_blocks = [
+                "[Revision Version] Structured revision round {}".format(iteration),
+                "[Core Topic] " + (original_outline[:240] if original_outline else "Stay focused on the current subsection topic."),
+                "[Writing Structure]",
+                "1) Start with the subsection's core definition or conclusion in one to two sentences.",
+                "2) Develop three to five points; each point must directly support the topic.",
+                "3) End with one paragraph summarizing the subsection's new information without repeating prior text.",
+            ]
+            if missing_anchor_terms:
+                structured_blocks.append("[Required Keywords] " + ", ".join(missing_anchor_terms))
+            if missing_terms:
+                structured_blocks.append("[Missing Topic Terms to Expand] " + ", ".join(missing_terms))
+            if missing_aspects:
+                structured_blocks.append("[Missing Content Aspects] " + ", ".join(missing_aspects))
+            if repeated_terms:
+                structured_blocks.append("[Avoid Repeating] " + ", ".join(repeated_terms))
+            if red_score > red_threshold:
+                structured_blocks.append("[Differentiation Requirement] Each point must add a new fact, case, datum, mechanism, criterion, or boundary condition.")
+            structured_blocks.append("[Professional Editing Requirement] Do not merely change formatting; every edit must add topic information, evidence, or reasoning.")
+            if feedback_text:
+                structured_blocks.append("[Verifier Feedback Constraint] " + feedback_text[:180])
+            structured_blocks.append("[Quality Thresholds] relevancy >= {:.2f}, redundancy <= {:.2f}".format(rel_threshold, red_threshold))
+        else:
+            structured_blocks = [
+                "【改纲版本】第{}轮结构化修订".format(iteration),
+                "【核心主题】" + (original_outline[:240] if original_outline else "请紧扣当前小节主题"),
+                "【写作结构】",
+                "1) 先给出本小节的核心定义/结论（1-2句）",
+                "2) 再按 3-5 个要点展开，每个要点必须直接支撑主题",
+                "3) 结尾用 1 段总结该小节新增信息，不复述前文",
+            ]
+            if missing_anchor_terms:
+                structured_blocks.append("【必写关键词】" + "、".join(missing_anchor_terms))
+            if missing_terms:
+                structured_blocks.append("【缺失主题词扩写】" + "、".join(missing_terms))
+            if missing_aspects:
+                structured_blocks.append("【必须补齐的内容面向】" + "、".join(missing_aspects))
+            if repeated_terms:
+                structured_blocks.append("【禁止重复词】" + "、".join(repeated_terms))
+            if red_score > red_threshold:
+                structured_blocks.append("【差异化要求】每个要点至少包含一个新的事实、案例、数据或机制说明。")
+            structured_blocks.append("【专业编辑要求】不要只增加格式；每一处修改都必须带来新的主题信息、证据或推理。")
+            if feedback_text:
+                structured_blocks.append("【Verifier反馈约束】" + feedback_text[:180])
+            structured_blocks.append("【质量阈值】relevancy >= {:.2f}, redundancy <= {:.2f}".format(rel_threshold, red_threshold))
 
         structured_rule_outline = _sanitize_outline_text("\n".join([blk for blk in structured_blocks if blk.strip()]))
 
@@ -1337,49 +2837,177 @@ async def improve_outline(req: ImproveOutlineRequest):
             red_threshold=float(red_threshold),
         )
 
-        defect_topic_outline = _sanitize_outline_text(
-            "\n".join(
-                [
-                    working_outline or original_outline,
-                    "",
-                    "【主题恢复 / Topic Recovery】优先修复 topic_alignment 与 coverage_completeness。",
-                    "【原始主题锁定】" + (original_outline[:260] if original_outline else "保持当前小节主题"),
-                    "- 核心论点：第一段必须直接回答原始小节标题，不得改写成泛泛背景介绍。",
-                    "- 主题锚点：每个段落至少包含 1 个原始主题关键词，并围绕该关键词给出结论句。",
-                    "- 覆盖清单：按“定义/机制 -> 代表方法 -> 应用场景 -> 评价指标 -> 风险边界 -> 未来方向”补齐缺失点。",
-                    "- 缺失主题词：" + ("、".join(missing_terms) if missing_terms else "从原始大纲中提取至少 5 个具体术语"),
-                    "- 缺失内容面向：" + ("、".join(missing_aspects) if missing_aspects else "根据大纲自行判断缺失的内容面向"),
-                    "- 证据约束：只有在主题句完成后才插入证据，不允许证据主题替代本小节主题。",
-                    "- 反漂移约束：禁止转向与原始小节无关的金融、心理、软件可靠性泛化案例。",
-                ]
-            )
-        )
+        if english_repair:
+            defect_topic_lines = [
+                working_outline or original_outline,
+                "",
+                "[Topic Recovery] Prioritize topic_alignment and coverage_completeness.",
+                "[Original Topic Lock] " + (original_outline[:260] if original_outline else "Preserve the current subsection topic."),
+                "- Core claim: the first paragraph must directly answer the original subsection heading, not become generic background.",
+                "- Topic anchors: every paragraph must contain at least one original topic keyword and build a conclusion around it.",
+                "- Coverage checklist: complete definition/mechanism -> representative methods -> application scenarios -> evaluation metrics -> risk boundaries -> future directions.",
+                "- Missing topic terms: " + (", ".join(missing_terms) if missing_terms else "extract at least five concrete terms from the original outline."),
+                "- Missing content aspects: " + (", ".join(missing_aspects) if missing_aspects else "infer missing aspects from the outline."),
+                "- Evidence constraint: insert evidence only after a topic sentence is established; evidence must not replace the subsection topic.",
+                "- Anti-drift constraint: do not shift to unrelated finance, psychology, or generic software-reliability cases.",
+            ]
+        else:
+            defect_topic_lines = [
+                working_outline or original_outline,
+                "",
+                "【主题恢复 / Topic Recovery】优先修复 topic_alignment 与 coverage_completeness。",
+                "【原始主题锁定】" + (original_outline[:260] if original_outline else "保持当前小节主题"),
+                "- 核心论点：第一段必须直接回答原始小节标题，不得改写成泛泛背景介绍。",
+                "- 主题锚点：每个段落至少包含 1 个原始主题关键词，并围绕该关键词给出结论句。",
+                "- 覆盖清单：按“定义/机制 -> 代表方法 -> 应用场景 -> 评价指标 -> 风险边界 -> 未来方向”补齐缺失点。",
+                "- 缺失主题词：" + ("、".join(missing_terms) if missing_terms else "从原始大纲中提取至少 5 个具体术语"),
+                "- 缺失内容面向：" + ("、".join(missing_aspects) if missing_aspects else "根据大纲自行判断缺失的内容面向"),
+                "- 证据约束：只有在主题句完成后才插入证据，不允许证据主题替代本小节主题。",
+                "- 反漂移约束：禁止转向与原始小节无关的金融、心理、软件可靠性泛化案例。",
+            ]
+        defect_topic_outline = _sanitize_outline_text("\n".join(defect_topic_lines), strip_repair_blocks=False)
         evidence_anchor_tokens: List[str] = []
         for _token in re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z0-9_-]{2,}", (original_outline + "\n" + working_outline)):
             if _token not in evidence_anchor_tokens:
                 evidence_anchor_tokens.append(_token)
             if len(evidence_anchor_tokens) >= 10:
                 break
-        defect_evidence_outline = _sanitize_outline_text(
-            "\n".join(
+        if english_repair:
+            defect_evidence_lines = [
+                working_outline or original_outline,
+                "",
+                "[Topic Lock] This evidence repair must not change the subsection topic: " + (original_outline[:220] if original_outline else "Preserve the current subsection topic."),
+                "[Evidence Plan] Prioritize evidence_grounding; do not write only abstract claims.",
+                "- Claim Slot A: state the subsection's most important evidence-supported claim in one sentence and bind it to at least two topic anchors.",
+                "- Evidence Slot 1: use available retrieved sources such as papers, reports, datasets, benchmarks, or reliable cases; insert [Source] at the supported sentence.",
+                "- Evidence Slot 2: add mechanistic evidence or an engineering case explaining how and under what conditions the claim holds.",
+                "- Evidence Slot 3: add one limitation, counterexample, or boundary condition to avoid overgeneralizing local evidence.",
+                "- Reasoning Slot: after each evidence item, add one sentence explaining how the evidence supports the claim.",
+                "- Same-sentence citation constraint: sentences using indicate, suggest, show, support, demonstrate, or reveal must include a valid [n] marker in the same sentence.",
+                "- Claim-citation template: 'The benchmark evidence shows the limitation [n].' Claim sentences of this kind require same-sentence citation.",
+                "- Missing evidence types: " + (", ".join(missing_evidence_types) if missing_evidence_types else "include at least two of method/model evidence, empirical or benchmark evidence, application case, and risk boundary."),
+                "- Retrieved source topic anchors: " + (", ".join(source_terms) if source_terms else "use the terms most relevant to the current topic from available sources."),
+                "- Anti-hallucination constraint: do not invent authors, years, DOIs, numbers, or nonexistent papers; if evidence is missing, use cautious wording and mark the claim for further verification.",
+                "- Citation placement: reserve at least one citation marker for each key paragraph; do not concentrate all citations at paragraph ends.",
+                "- If novelty/redundancy also fails, replace repeated background with source-bound mechanisms, metrics, and boundary conditions; do not merely add citations.",
+                "- Score-preservation constraint: new evidence should naturally preserve core source/reference terminology to protect ROUGE/BERTScore semantic and lexical alignment.",
+                "- Topic anchors: " + (", ".join(evidence_anchor_tokens) if evidence_anchor_tokens else "preserve the original topic keywords."),
+            ]
+        else:
+            defect_evidence_lines = [
+                working_outline or original_outline,
+                "",
+                "【主题锁定】本轮证据修复不得改变原小节主题：" + (original_outline[:220] if original_outline else "保持当前小节主题"),
+                "【证据计划 / Evidence Plan】优先修复 evidence_grounding，不得只写抽象观点。",
+                "- 主张槽 Claim A：用 1 句话写出本小节最核心、可被证据支持的论点，并绑定至少 2 个主题锚点。",
+                "- 证据槽 Evidence Slot 1：从已检索/可用来源中寻找论文、报告、数据集、基准实验或可靠案例；在正文对应句后插入引用位置 [Source]。",
+                "- 证据槽 Evidence Slot 2：补充一个机制性证据或工程案例，说明该主张如何发生、在哪些条件下成立。",
+                "- 证据槽 Evidence Slot 3：加入一个限制/反例/边界条件，避免把局部证据扩大成普遍结论。",
+                "- 推理槽 Reasoning：每个证据后必须写 1 句“证据如何支撑主张”的解释，而不是只堆引用。",
+                "- 同句引用约束：凡使用 indicate/suggest/show/support/demonstrate/reveal/说明/表明/显示/支持 等主张动词的句子，必须在同一句包含有效引用标记 [n]；不能只把引用放在上一句、下一句或段末。",
+                "- Claim-citation template: 'The benchmark evidence shows the limitation [n].' 这类 claim sentence 必须同句引用。",
+                "- 缺失证据类型：" + ("、".join(missing_evidence_types) if missing_evidence_types else "至少包含方法/模型、实证或基准、应用案例、风险边界中的两类"),
+                "- 检索来源主题锚点：" + ("、".join(source_terms) if source_terms else "使用当前来源中与主题最相关的术语"),
+                "- 防幻觉约束：不得编造作者、年份、DOI、数值或不存在的论文；缺少来源时必须改写为谨慎表述并标注需要进一步验证。",
+                "- 引用位置：每个关键段落至少预留 1 个引用标记位置，不把所有引用集中到段末。",
+                "- 若同时存在 novelty/redundancy 问题：删除重复背景句，改为来源绑定的新机制、新评价指标、新边界条件；不要只增加引用。",
+                "- 保分约束：新增证据必须自然包含当前 source/reference 的核心术语，避免牺牲 ROUGE/BERTScore 的语义与词面对齐。",
+                "- 主题锚点：" + ("、".join(evidence_anchor_tokens) if evidence_anchor_tokens else "保持原主题关键词"),
+            ]
+        defect_evidence_outline = _sanitize_outline_text("\n".join(defect_evidence_lines), strip_repair_blocks=False)
+        novelty_anchor_tokens: List[str] = []
+        novelty_exclusive_terms: List[str] = []
+        novelty_stop = {
+            "build", "beyond", "explain", "write", "section", "subsection",
+            "content", "introduce", "technical", "current", "prior", "previous",
+            "use", "using", "used", "include", "including", "from", "into",
+            "that", "this", "with", "without", "their", "these", "those",
+        }
+        history_lower = history_text.lower()
+        for _token in re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z0-9_-]{2,}", original_outline):
+            normalized_token = _token.lower()
+            if normalized_token in novelty_stop:
+                continue
+            if _token not in novelty_anchor_tokens:
+                novelty_anchor_tokens.append(_token)
+            if normalized_token not in history_lower and _token not in novelty_exclusive_terms:
+                novelty_exclusive_terms.append(_token)
+            if len(novelty_anchor_tokens) >= 12 and len(novelty_exclusive_terms) >= 10:
+                break
+        redundancy_details = ((req.feedback.get("raw_data") or {}).get("redundancy") or {}) if isinstance(req.feedback.get("raw_data"), dict) else {}
+        if not isinstance(redundancy_details, dict):
+            redundancy_details = {}
+        raw_feedback = req.feedback.get("raw_data") if isinstance(req.feedback.get("raw_data"), dict) else {}
+        novelty_details = req.feedback.get("novelty_diagnostics") if isinstance(req.feedback.get("novelty_diagnostics"), dict) else {}
+        if not novelty_details and isinstance(raw_feedback, dict):
+            novelty_details = raw_feedback.get("novelty_diagnostics") if isinstance(raw_feedback.get("novelty_diagnostics"), dict) else {}
+        overlap_terms = [
+            str(x)
+            for x in redundancy_details.get("overlap_terms", [])
+            if str(x).strip()
+        ][:12]
+        overlap_bigrams = [
+            str(x)
+            for x in redundancy_details.get("overlap_bigrams", [])
+            if str(x).strip()
+        ][:8]
+        novelty_new_terms = [str(x) for x in novelty_details.get("new_terms", []) if str(x).strip()][:10]
+        novelty_new_phrases = [str(x) for x in novelty_details.get("new_phrases", []) if str(x).strip()][:8]
+        novelty_source_terms = [str(x) for x in novelty_details.get("new_source_terms", []) if str(x).strip()][:8]
+        max_history_index = redundancy_details.get("max_history_index")
+        if english_repair:
+            novelty_diagnostic_line = ", ".join(
                 [
-                    working_outline or original_outline,
-                    "",
-                    "【主题锁定】本轮证据修复不得改变原小节主题：" + (original_outline[:220] if original_outline else "保持当前小节主题"),
-                    "【证据计划 / Evidence Plan】优先修复 evidence_grounding，不得只写抽象观点。",
-                    "- 主张槽 Claim A：用 1 句话写出本小节最核心、可被证据支持的论点，并绑定至少 2 个主题锚点。",
-                    "- 证据槽 Evidence Slot 1：从已检索/可用来源中寻找论文、报告、数据集、基准实验或可靠案例；在正文对应句后插入引用位置 [Source]。",
-                    "- 证据槽 Evidence Slot 2：补充一个机制性证据或工程案例，说明该主张如何发生、在哪些条件下成立。",
-                    "- 证据槽 Evidence Slot 3：加入一个限制/反例/边界条件，避免把局部证据扩大成普遍结论。",
-                    "- 推理槽 Reasoning：每个证据后必须写 1 句“证据如何支撑主张”的解释，而不是只堆引用。",
-                    "- 缺失证据类型：" + ("、".join(missing_evidence_types) if missing_evidence_types else "至少包含方法/模型、实证或基准、应用案例、风险边界中的两类"),
-                    "- 检索来源主题锚点：" + ("、".join(source_terms) if source_terms else "使用当前来源中与主题最相关的术语"),
-                    "- 防幻觉约束：不得编造作者、年份、DOI、数值或不存在的论文；缺少来源时必须改写为谨慎表述并标注需要进一步验证。",
-                    "- 引用位置：每个关键段落至少预留 1 个引用标记位置，不把所有引用集中到段末。",
-                    "- 主题锚点：" + ("、".join(evidence_anchor_tokens) if evidence_anchor_tokens else "保持原主题关键词"),
+                    ("highest-overlap history index=" + str(max_history_index)) if max_history_index is not None else "",
+                    ("overlap term count=" + str(len(overlap_terms))) if overlap_terms else "",
+                    ("overlap phrase count=" + str(len(overlap_bigrams))) if overlap_bigrams else "",
+                    ("new information term count=" + str(len(novelty_new_terms))) if novelty_new_terms else "",
+                    ("new phrase count=" + str(len(novelty_new_phrases))) if novelty_new_phrases else "",
+                    ("new source term count=" + str(len(novelty_source_terms))) if novelty_source_terms else "",
                 ]
-            )
-        )
+            ).strip(", ")
+            novelty_lines = [
+                working_outline or original_outline,
+                "",
+                "[Novelty Repair] Prioritize novelty and redundancy without changing the subsection topic.",
+                "[Detection Principle] Novelty is not 1 - redundancy; it checks information gain, new terms/phrases, new analytical aspects, and source-specific claims relative to prior text.",
+                "[Diagnosis] " + (novelty_diagnostic_line if novelty_diagnostic_line else "No specific repeated terms were provided; still add source-bound information gain."),
+                "- Preserve the current subsection mission and valid citation markers; do not restate prior definitions, background, or examples.",
+                "- Mandatory subsection-exclusive concepts: " + (", ".join(novelty_exclusive_terms) if novelty_exclusive_terms else "derive at least four concepts absent from the prior text."),
+                "- Use exclusive concepts as paragraph-level slots; each slot must add a distinct mechanism, case, evaluation criterion, or boundary condition.",
+                "- Replace repeated background at equal length; do not append new material after retaining repeated passages.",
+                "- Mention the prior subsection only once in a short transition, then spend the remaining paragraphs on this subsection's unique contribution.",
+                "- Prefer source concepts not used previously and form at least two source-bound claims with explicit evidence-to-claim reasoning.",
+                "- Preserve-score constraint: keep indispensable topic anchors while changing paragraph openings, mechanisms, examples, and analytical dimensions.",
+                "- Topic anchors: " + (", ".join(novelty_anchor_tokens) if novelty_anchor_tokens else "preserve the original subsection terms."),
+            ]
+        else:
+            novelty_diagnostic_line = "、".join(
+                [
+                    ("最高重叠历史段 index=" + str(max_history_index)) if max_history_index is not None else "",
+                    ("检测到重复词数量=" + str(len(overlap_terms))) if overlap_terms else "",
+                    ("检测到重复短语数量=" + str(len(overlap_bigrams))) if overlap_bigrams else "",
+                    ("已有信息增量词数量=" + str(len(novelty_new_terms))) if novelty_new_terms else "",
+                    ("已有新短语数量=" + str(len(novelty_new_phrases))) if novelty_new_phrases else "",
+                    ("新增来源术语数量=" + str(len(novelty_source_terms))) if novelty_source_terms else "",
+                ]
+            ).strip("、")
+            novelty_lines = [
+                working_outline or original_outline,
+                "",
+                "【新颖性修复 / Novelty Repair】优先修复 novelty 与 redundancy，不改变原小节主题。",
+                "【检测原理】novelty 不再等同于 1 - redundancy；它同时检查相对历史的小节信息增量、新内容词/短语、新分析面向和 source-specific claim。",
+                "【诊断】" + (novelty_diagnostic_line if novelty_diagnostic_line else "未提供具体重复词；仍需主动增加来源绑定的信息增量。"),
+                "- Preserve the current subsection mission and valid citation markers; do not restate prior definitions, background, or examples.",
+                "- Mandatory subsection-exclusive concepts: " + (", ".join(novelty_exclusive_terms) if novelty_exclusive_terms else "derive at least four concepts absent from the prior text"),
+                "- Use the exclusive concepts as paragraph-level slots. Each slot must add a distinct mechanism, case, evaluation criterion, or boundary condition.",
+                "- Replace repeated background at equal length; do not append new material after retaining the repeated passage.",
+                "- Mention the prior subsection only once in a short transition, then spend all remaining paragraphs on the current subsection's unique contribution.",
+                "- Prefer source concepts not used previously and form at least two source-bound claims with an explicit evidence-to-claim explanation.",
+                "- Preserve-score constraint: keep indispensable topic anchors while changing paragraph openings, mechanisms, examples, and analytical dimensions.",
+                "- Topic anchors: " + (", ".join(novelty_anchor_tokens) if novelty_anchor_tokens else "preserve the original subsection terms"),
+            ]
+        defect_novelty_outline = _sanitize_outline_text("\n".join(novelty_lines), strip_repair_blocks=False)
         baseline_outline = working_outline or original_outline
         topic_anchor_tokens: List[str] = []
         for _token in re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z0-9_-]{2,}", baseline_outline or original_outline or ""):
@@ -1387,21 +3015,31 @@ async def improve_outline(req: ImproveOutlineRequest):
                 topic_anchor_tokens.append(_token)
             if len(topic_anchor_tokens) >= 8:
                 break
-        defect_structure_outline = _sanitize_outline_text(
-            "\n".join(
-                [
-                    baseline_outline,
-                    "",
-                    "【结构化修复约束】",
-                    "- 保留并强化上方原小节主题，不得改写为通用模板。",
-                    "- 第一段给出本小节的核心论点，并直接回应原大纲标题。",
-                    "- 中间段按“概念/机制 -> 证据或案例 -> 分析推理 -> 局限或边界”展开。",
-                    "- 每个段落至少包含一个与原主题强相关的关键词、事实或可验证论据。",
-                    "- 结尾只做本小节范围内的小结，并说明与前后小节的信息增量。",
-                    "- 主题锚点：" + ("、".join(topic_anchor_tokens) if topic_anchor_tokens else "保持原主题关键词"),
-                ]
-            )
-        )
+        if english_repair:
+            structure_lines = [
+                baseline_outline,
+                "",
+                "[Structure Repair]",
+                "- Preserve and strengthen the subsection topic above; do not rewrite it into a generic template.",
+                "- The first paragraph must state the subsection's core claim and directly answer the original outline heading.",
+                "- Middle paragraphs should follow concept/mechanism -> evidence or case -> analytical reasoning -> limitation or boundary.",
+                "- Every paragraph must include at least one keyword, fact, or verifiable argument strongly tied to the original topic.",
+                "- End with a subsection-level synthesis only, explaining the information gain relative to neighboring sections.",
+                "- Topic anchors: " + (", ".join(topic_anchor_tokens) if topic_anchor_tokens else "preserve the original topic keywords."),
+            ]
+        else:
+            structure_lines = [
+                baseline_outline,
+                "",
+                "【结构化修复约束】",
+                "- 保留并强化上方原小节主题，不得改写为通用模板。",
+                "- 第一段给出本小节的核心论点，并直接回应原大纲标题。",
+                "- 中间段按“概念/机制 -> 证据或案例 -> 分析推理 -> 局限或边界”展开。",
+                "- 每个段落至少包含一个与原主题强相关的关键词、事实或可验证论据。",
+                "- 结尾只做本小节范围内的小结，并说明与前后小节的信息增量。",
+                "- 主题锚点：" + ("、".join(topic_anchor_tokens) if topic_anchor_tokens else "保持原主题关键词"),
+            ]
+        defect_structure_outline = _sanitize_outline_text("\n".join(structure_lines), strip_repair_blocks=False)
         baseline_score = _score_outline_candidate(
             candidate_outline=baseline_outline,
             original_outline=original_outline,
@@ -1427,8 +3065,46 @@ async def improve_outline(req: ImproveOutlineRequest):
             candidates.append({"source": "defect_topic", "outline": defect_topic_outline})
         if defect_evidence_outline:
             candidates.append({"source": "defect_evidence", "outline": defect_evidence_outline})
+        if defect_novelty_outline:
+            candidates.append({"source": "defect_novelty", "outline": defect_novelty_outline})
         if defect_structure_outline:
             candidates.append({"source": "defect_structure", "outline": defect_structure_outline})
+            candidates.append({"source": "structure_readability_repair", "outline": defect_structure_outline})
+        if defect_novelty_outline:
+            candidates.append({"source": "novelty_repair", "outline": defect_novelty_outline})
+        if defect_evidence_outline:
+            claim_evidence_outline = defect_evidence_outline + (
+                "\n[Claim-Evidence Repair] Bind every major claim to source-grounded evidence and add one reasoning sentence after each evidence cue."
+                if english_repair
+                else "\n【Claim-Evidence Repair】每个主要 claim 必须绑定 source-grounded evidence，并在证据后补一句 reasoning。"
+            )
+            citation_grounding_outline = defect_evidence_outline + (
+                "\n[Citation Grounding Repair] Every citation marker must support the same-sentence claim; do not invent sources, authors, years, URLs, or DOIs."
+                if english_repair
+                else "\n【Citation Grounding Repair】每个引用标记必须支撑同句 claim；不得编造来源、作者、年份、URL 或 DOI。"
+            )
+            external_metric_outline = defect_evidence_outline + (
+                "\n[External Metric Repair] Preserve source/reference terminology naturally while improving claim specificity; no mechanical keyword stuffing."
+                if english_repair
+                else "\n【External Metric Repair】自然保留 source/reference 关键术语并提高 claim 具体性；禁止机械堆词。"
+            )
+            reproducibility_outline = defect_evidence_outline + (
+                "\n[Reproducibility Repair] Add supported dataset, protocol, parameter, implementation, audit-trail, or replication constraints; unsupported details must be framed as requirements."
+                if english_repair
+                else "\n【Reproducibility Repair】补充有来源支持的 dataset/protocol/parameter/implementation/audit-trail/replication 约束；无来源细节只能写成要求。"
+            )
+            reviewer_risk_outline = defect_evidence_outline + (
+                "\n[Reviewer-Risk Repair] Address likely reviewer concerns: unsupported claim, weak novelty, missing limitation, missing evaluation, and reproducibility risk."
+                if english_repair
+                else "\n【Reviewer-Risk Repair】回应 reviewer 可能质疑：无支撑 claim、新颖性弱、缺少 limitation、缺少 evaluation、可复现风险。"
+            )
+            candidates.extend([
+                {"source": "claim_evidence_repair", "outline": claim_evidence_outline},
+                {"source": "citation_grounding_repair", "outline": citation_grounding_outline},
+                {"source": "external_metric_repair", "outline": external_metric_outline},
+                {"source": "reproducibility_repair", "outline": reproducibility_outline},
+                {"source": "reviewer_risk_repair", "outline": reviewer_risk_outline},
+            ])
 
         seen = set()
         dedup_candidates: List[Dict[str, Any]] = []
@@ -1468,7 +3144,11 @@ async def improve_outline(req: ImproveOutlineRequest):
         min_coherence_gain = float(os.getenv("CONTROLLER_MIN_COHERENCE_GAIN", "0.03"))
         min_evidence_gain = float(os.getenv("CONTROLLER_MIN_EVIDENCE_GAIN", "0.05"))
 
-        bandit_enabled = os.getenv("CONTROLLER_BANDIT_ENABLED", "true").lower() == "true"
+        bandit_enabled = (
+            bool(req.controller_bandit_enabled)
+            if req.controller_bandit_enabled is not None
+            else os.getenv("CONTROLLER_BANDIT_ENABLED", "true").lower() == "true"
+        )
         feature_vector = _build_bandit_context_features(
             rel_score=rel_score,
             red_score=red_score,
@@ -1490,6 +3170,11 @@ async def improve_outline(req: ImproveOutlineRequest):
             "selection": {},
             "state_path": _bandit_state_path(),
         }
+        fixed_arm = (
+            str(req.controller_fixed_arm or "").strip()
+            if req.controller_fixed_arm is not None
+            else os.getenv("CONTROLLER_FIXED_ARM", "").strip()
+        )
 
         if dedup_candidates:
             best_candidate_by_source: Dict[str, Dict[str, Any]] = {}
@@ -1497,10 +3182,32 @@ async def improve_outline(req: ImproveOutlineRequest):
                 src = cand["source"]
                 if src not in best_candidate_by_source or cand["score"]["total"] > best_candidate_by_source[src]["score"]["total"]:
                     best_candidate_by_source[src] = cand
+            best_candidate_by_source, exclusion_debug = _apply_request_local_arm_exclusions(
+                best_candidate_by_source,
+                req.controller_excluded_arms,
+            )
+            bandit_debug.update(exclusion_debug)
+            failed_dims_for_compatibility = (
+                req.feedback.get("quality_dimensions_failed")
+                if isinstance(req.feedback.get("quality_dimensions_failed"), list)
+                else []
+            )
+            best_candidate_by_source, compatibility_debug = _filter_defect_compatible_candidates(
+                best_candidate_by_source,
+                defect_graph,
+                failed_dims_for_compatibility,
+            )
+            bandit_debug.update(compatibility_debug)
             if bandit_enabled:
                 available_arms = [
                     arm
-                    for arm in ["llm", "rule", "rule_structured", "defect_topic", "defect_evidence", "defect_structure"]
+                    for arm in [
+                        "llm", "rule", "rule_structured", "defect_topic", "defect_evidence",
+                        "defect_novelty", "defect_structure", "novelty_repair",
+                        "claim_evidence_repair", "citation_grounding_repair",
+                        "reviewer_risk_repair", "external_metric_repair",
+                        "structure_readability_repair", "reproducibility_repair",
+                    ]
                     if arm in best_candidate_by_source
                 ]
                 if available_arms:
@@ -1520,8 +3227,24 @@ async def improve_outline(req: ImproveOutlineRequest):
                     chosen = max(dedup_candidates, key=lambda x: x["score"]["total"])
                     chosen_source = chosen["source"]
             else:
-                chosen = max(dedup_candidates, key=lambda x: x["score"]["total"])
-                chosen_source = chosen["source"]
+                allow_no_bandit_llm = (
+                    bool(req.controller_no_bandit_allow_llm)
+                    if req.controller_no_bandit_allow_llm is not None
+                    else os.getenv("CONTROLLER_NO_BANDIT_ALLOW_LLM", "false").lower() == "true"
+                )
+                if not allow_no_bandit_llm and "llm" in best_candidate_by_source:
+                    best_candidate_by_source = {
+                        arm: cand for arm, cand in best_candidate_by_source.items() if arm != "llm"
+                    }
+                if fixed_arm and fixed_arm in best_candidate_by_source:
+                    chosen = best_candidate_by_source[fixed_arm]
+                    chosen_source = fixed_arm
+                    bandit_debug["selection"] = {"mode": "fixed_arm_no_bandit", "fixed_arm": fixed_arm}
+                else:
+                    candidate_pool = list(best_candidate_by_source.values()) or dedup_candidates
+                    chosen = max(candidate_pool, key=lambda x: x["score"]["total"])
+                    chosen_source = chosen["source"]
+                    bandit_debug["selection"] = {"mode": "best_score_no_bandit"}
 
             # Risk-sensitive override: when evidence grounding is the dominant
             # failure mode, do not let historical bandit inertia pick a weaker
@@ -1530,9 +3253,40 @@ async def improve_outline(req: ImproveOutlineRequest):
             evidence_override_margin = float(os.getenv("CONTROLLER_EVIDENCE_OVERRIDE_MARGIN", "0.08"))
             evidence_candidate = best_candidate_by_source.get("defect_evidence")
             chosen_total = float((chosen or {}).get("score", {}).get("total", 0.0)) if chosen else 0.0
+            evidence_usage_for_override = float(evidence_diag.get("source_usage_coverage", 0.0) or 0.0) if isinstance(evidence_diag, dict) else 0.0
+            claim_alignment_for_override = float(evidence_diag.get("claim_evidence_alignment", 0.0) or 0.0) if isinstance(evidence_diag, dict) else 0.0
+            source_failures_for_override = evidence_diag.get("source_failures") if isinstance(evidence_diag, dict) else []
+            if not isinstance(source_failures_for_override, list):
+                source_failures_for_override = []
+            severe_source_failures_for_override = {
+                str(item)
+                for item in source_failures_for_override
+                if str(item) not in {"insufficient_citations", "missing_evidence_type:application_or_case"}
+            }
+            soft_citation_only_for_override = bool(source_failures_for_override) and not severe_source_failures_for_override
+            novelty_primary_with_soft_citation = bool(
+                "novelty" in failed_dims_for_override
+                and "evidence_grounding" not in failed_dims_for_override
+                and soft_citation_only_for_override
+                and claim_alignment_for_override >= 0.62
+            )
             if (
+                bandit_enabled
+                and
                 evidence_candidate
-                and ("evidence_grounding" in failed_dims_for_override or float(defect_graph.get("evidence", 0.0)) >= 0.55)
+                and not novelty_primary_with_soft_citation
+                and not _coherence_repair_blocks_evidence_override(
+                    chosen_source=chosen_source,
+                    failed_dims=failed_dims_for_override,
+                    defect_graph=defect_graph,
+                    evidence_diag=evidence_diag if isinstance(evidence_diag, dict) else {},
+                )
+                and (
+                    "evidence_grounding" in failed_dims_for_override
+                    or float(defect_graph.get("evidence", 0.0)) >= 0.55
+                    or evidence_usage_for_override < 0.92
+                    or claim_alignment_for_override < 0.62
+                )
                 and (
                     float(defect_graph.get("evidence", 0.0)) >= float(defect_graph.get("topic", 0.0)) + 0.05
                     or rel_score >= rel_threshold * 0.85
@@ -1570,6 +3324,8 @@ async def improve_outline(req: ImproveOutlineRequest):
                 )
             )
             if (
+                bandit_enabled
+                and
                 topic_candidate
                 and topic_dominant
                 and (
@@ -1588,6 +3344,111 @@ async def improve_outline(req: ImproveOutlineRequest):
                 }
                 bandit_debug["selected_arm"] = "defect_topic"
 
+            novelty_candidate = best_candidate_by_source.get("defect_novelty")
+            novelty_override_margin = float(os.getenv("CONTROLLER_NOVELTY_OVERRIDE_MARGIN", "0.10"))
+            chosen_total = float((chosen or {}).get("score", {}).get("total", 0.0)) if chosen else 0.0
+            novelty_dominant = bool(
+                novelty_candidate
+                and (
+                    "novelty" in failed_dims_for_override
+                    or red_score > red_threshold
+                    or float(defect_graph.get("novelty", 0.0)) >= 0.02
+                    or float(defect_graph.get("redundancy", 0.0)) >= 0.02
+                )
+                and "evidence_grounding" not in failed_dims_for_override
+                and float(defect_graph.get("evidence", 0.0)) < 0.25
+                and rel_score >= rel_threshold * 0.85
+            )
+            if (
+                bandit_enabled
+                and
+                novelty_candidate
+                and novelty_dominant
+                and float(novelty_candidate["score"].get("total", 0.0)) >= chosen_total - novelty_override_margin
+            ):
+                current_novelty_score = float((chosen or {}).get("score", {}).get("novelty", 0.0)) if chosen else 0.0
+                evidence_active_for_novelty = _evidence_active_for_novelty_repair(
+                    evidence_diag=evidence_diag if isinstance(evidence_diag, dict) else {},
+                    failed_dims=failed_dims_for_override,
+                    defect_graph=defect_graph,
+                )
+                # A strong evidence score means the novelty repair should preserve
+                # the existing evidence plan, not switch to an evidence-repair arm.
+                evidence_guard_active = evidence_active_for_novelty
+                evidence_preserving_novelty = _select_evidence_preserving_novelty_candidate(
+                    chosen=chosen,
+                    evidence_candidate=evidence_candidate,
+                    evidence_guard_active=evidence_guard_active,
+                )
+                if evidence_preserving_novelty:
+                    chosen = evidence_preserving_novelty
+                    chosen_source = str(evidence_preserving_novelty.get("source", "defect_evidence"))
+                    bandit_debug["override"] = {
+                        "reason": "evidence_preserving_novelty_repair",
+                        "previous_arm": bandit_debug.get("selected_arm", ""),
+                        "previous_total": round(chosen_total, 4),
+                        "override_total": evidence_preserving_novelty["score"].get("total", 0.0),
+                        "override_novelty": evidence_preserving_novelty["score"].get("novelty", 0.0),
+                        "override_evidence": evidence_preserving_novelty["score"].get("evidence_signal", 0.0),
+                        "evidence_active_for_novelty": evidence_active_for_novelty,
+                        "evidence_guard_active": evidence_guard_active,
+                        "margin": novelty_override_margin,
+                    }
+                    bandit_debug["selected_arm"] = chosen_source
+                    continue_novelty_safe_selection = False
+                else:
+                    continue_novelty_safe_selection = True
+                current_evidence_score = float((chosen or {}).get("score", {}).get("evidence_signal", 0.0)) if chosen else 0.0
+                novelty_safe_candidates = [
+                    cand
+                    for cand in best_candidate_by_source.values()
+                    if (
+                        float(cand.get("score", {}).get("relevance_anchor", 0.0)) >= 0.95
+                        and float(cand.get("score", {}).get("novelty", 0.0)) >= current_novelty_score + 0.006
+                        and (
+                            not evidence_active_for_novelty
+                            or float(cand.get("score", {}).get("evidence_signal", 0.0)) >= current_evidence_score - 0.05
+                            or float(cand.get("score", {}).get("evidence_signal", 0.0)) >= 0.75
+                        )
+                        and (
+                            evidence_active_for_novelty
+                            or str(cand.get("source", "")) != "defect_evidence"
+                            or float(cand.get("score", {}).get("novelty", 0.0)) >= current_novelty_score + 0.018
+                        )
+                    )
+                ]
+                if continue_novelty_safe_selection and novelty_safe_candidates:
+                    def _novelty_safe_score(cand: Dict[str, Any]) -> float:
+                        score = cand.get("score", {}) if isinstance(cand.get("score"), dict) else {}
+                        evidence_part = (
+                            0.18 * float(score.get("evidence_signal", 0.0))
+                            if evidence_active_for_novelty
+                            else 0.0
+                        )
+                        return (
+                            0.57 * float(score.get("novelty", 0.0))
+                            + 0.25 * float(score.get("total", 0.0))
+                            + 0.10 * float(score.get("coherence_signal", 0.0))
+                            + evidence_part
+                        )
+
+                    novelty_choice = max(novelty_safe_candidates, key=_novelty_safe_score)
+                elif continue_novelty_safe_selection:
+                    novelty_choice = novelty_candidate
+                if continue_novelty_safe_selection:
+                    chosen = novelty_choice
+                    chosen_source = str(novelty_choice.get("source", "defect_novelty"))
+                    bandit_debug["override"] = {
+                        "reason": "dominant_novelty_defect_safe_candidate",
+                        "previous_arm": bandit_debug.get("selected_arm", ""),
+                        "previous_total": round(chosen_total, 4),
+                        "override_total": novelty_choice["score"].get("total", 0.0),
+                        "override_novelty": novelty_choice["score"].get("novelty", 0.0),
+                        "evidence_active_for_novelty": evidence_active_for_novelty,
+                        "margin": novelty_override_margin,
+                    }
+                    bandit_debug["selected_arm"] = chosen_source
+
             # Final guard: overrides can still keep selecting an arm that has
             # just failed repeatedly. Shift to the best viable alternative so
             # controller repairs do not spiral into the same low-yield outline.
@@ -1596,7 +3457,7 @@ async def improve_outline(req: ImproveOutlineRequest):
                     with BANDIT_LOCK:
                         cooldown_state = _load_bandit_state(len(feature_vector))
                     cooldown_streak = max(1, int(os.getenv("CONTROLLER_ARM_COOLDOWN_STREAK", "2")))
-                    min_alt_ratio = max(0.0, min(1.0, float(os.getenv("CONTROLLER_COOLDOWN_MIN_ALT_SCORE_RATIO", "0.55"))))
+                    min_alt_ratio = max(0.0, min(1.0, float(os.getenv("CONTROLLER_COOLDOWN_MIN_ALT_SCORE_RATIO", "0.90"))))
                     arm_state = (cooldown_state.get("arms") or {}).get(chosen_source, {})
                     ineffective_streak = int(arm_state.get("ineffective_streak", 0) or 0) if isinstance(arm_state, dict) else 0
                     if ineffective_streak >= cooldown_streak and len(best_candidate_by_source) > 1:
@@ -1609,6 +3470,19 @@ async def improve_outline(req: ImproveOutlineRequest):
                             key=lambda cand: float(cand.get("score", {}).get("total", 0.0)),
                             reverse=True,
                         )
+                        if novelty_dominant and chosen_source == "defect_novelty":
+                            current_novelty = float((chosen or {}).get("score", {}).get("novelty", 0.0))
+                            alternatives = [
+                                alt
+                                for alt in alternatives
+                                if (
+                                    float(alt.get("score", {}).get("novelty", 0.0)) >= current_novelty - 0.001
+                                    and (
+                                        str(alt.get("source", "")) != "defect_evidence"
+                                        or float(defect_graph.get("evidence", 0.0)) >= 0.25
+                                    )
+                                )
+                            ]
                         for alt in alternatives:
                             alt_source = str(alt.get("source", ""))
                             alt_state = (cooldown_state.get("arms") or {}).get(alt_source, {})
@@ -1629,6 +3503,202 @@ async def improve_outline(req: ImproveOutlineRequest):
                 except Exception as _cooldown_error:
                     bandit_debug["cooldown_error"] = str(_cooldown_error)[:180]
 
+            if bandit_enabled and chosen and best_candidate_by_source:
+                aligned_choice, alignment_override = _select_defect_aligned_candidate(
+                    chosen=chosen,
+                    best_candidate_by_source=best_candidate_by_source,
+                    defect_graph=defect_graph,
+                    failed_dims=failed_dims_for_override,
+                )
+                if alignment_override:
+                    chosen = aligned_choice
+                    chosen_source = str(aligned_choice.get("source", chosen_source))
+                    bandit_debug["defect_alignment_override"] = alignment_override
+                    bandit_debug["selected_arm"] = chosen_source
+                    bandit_debug.setdefault("selection", {})["mode"] = "defect_alignment_guard"
+
+            # No-harm guard before generation: if the failed draft already has
+            # acceptable evidence/claim alignment, avoid a novelty or cooldown
+            # choice whose outline loses the explicit evidence plan. This keeps
+            # Controller repairs targeted instead of trading one dimension for
+            # a regression in another.
+            if bandit_enabled and chosen and best_candidate_by_source:
+                chosen_score = chosen.get("score", {}) if isinstance(chosen.get("score"), dict) else {}
+                chosen_evidence_signal = float(chosen_score.get("evidence_signal", 0.0) or 0.0)
+                chosen_total = float(chosen_score.get("total", 0.0) or 0.0)
+                preserve_claim_alignment = bool(
+                    claim_alignment_for_override >= float(os.getenv("CONTROLLER_PRESERVE_CLAIM_ALIGNMENT_MIN", "0.80"))
+                    and evidence_usage_for_override >= float(os.getenv("CONTROLLER_PRESERVE_SOURCE_USAGE_MIN", "0.90"))
+                )
+                evidence_defect_active = bool(
+                    "evidence_grounding" in failed_dims_for_override
+                    or float(defect_graph.get("evidence", 0.0) or 0.0) >= 0.25
+                )
+                evidence_preserving_margin = float(os.getenv("CONTROLLER_EVIDENCE_PRESERVE_MARGIN", "0.025"))
+                evidence_preserving_candidates = [
+                    cand
+                    for cand in best_candidate_by_source.values()
+                    if (
+                        float(cand.get("score", {}).get("evidence_signal", 0.0) or 0.0)
+                        >= max(0.75, chosen_evidence_signal + 0.20)
+                        and float(cand.get("score", {}).get("relevance_anchor", 0.0) or 0.0) >= 0.92
+                        and float(cand.get("score", {}).get("total", 0.0) or 0.0)
+                        >= chosen_total - evidence_preserving_margin
+                        and (
+                            not novelty_dominant
+                            or float(cand.get("score", {}).get("novelty", 0.0) or 0.0)
+                            >= float(chosen_score.get("novelty", 0.0) or 0.0) - 0.012
+                        )
+                    )
+                ]
+                if evidence_defect_active and preserve_claim_alignment and evidence_preserving_candidates:
+                    preserved = max(
+                        evidence_preserving_candidates,
+                        key=lambda cand: (
+                            float(cand.get("score", {}).get("total", 0.0) or 0.0),
+                            float(cand.get("score", {}).get("evidence_signal", 0.0) or 0.0),
+                            float(cand.get("score", {}).get("novelty", 0.0) or 0.0),
+                        ),
+                    )
+                    preserved_source = str(preserved.get("source", ""))
+                    if preserved_source and preserved_source != chosen_source:
+                        bandit_debug["evidence_preserving_override"] = {
+                            "reason": "preserve_claim_evidence_alignment",
+                            "previous_arm": chosen_source,
+                            "previous_total": round(chosen_total, 4),
+                            "previous_evidence_signal": round(chosen_evidence_signal, 4),
+                            "new_arm": preserved_source,
+                            "new_total": preserved.get("score", {}).get("total", 0.0),
+                            "new_evidence_signal": preserved.get("score", {}).get("evidence_signal", 0.0),
+                            "margin": evidence_preserving_margin,
+                        }
+                        chosen = preserved
+                        chosen_source = preserved_source
+                        bandit_debug["selected_arm"] = preserved_source
+                        bandit_debug.setdefault("selection", {})["mode"] = "evidence_preserving_guard"
+
+            hard_gate = (bandit_debug.get("selection") or {}).get("hard_gate")
+            hard_gate_arm = str((hard_gate or {}).get("selected") or "").strip() if isinstance(hard_gate, dict) else ""
+            source_audit_evidence_lock = False
+            source_audit_active = bool(
+                req.feedback.get("source_alignment_low_pass_audit")
+                or "source_alignment_low_pass" in str(req.feedback.get("feedback", "")).lower()
+            )
+            if (
+                bandit_enabled
+                and source_audit_active
+                and "topic_alignment" not in failed_dims_for_override
+                and best_candidate_by_source.get("defect_evidence")
+            ):
+                chosen = best_candidate_by_source["defect_evidence"]
+                chosen_source = "defect_evidence"
+                source_audit_evidence_lock = True
+                bandit_debug["source_audit_arm_lock"] = {
+                    "reason": "source_alignment_audit_requires_evidence_repair",
+                    "previous_arm": bandit_debug.get("selected_arm", ""),
+                    "locked_arm": "defect_evidence",
+                }
+                bandit_debug["selected_arm"] = "defect_evidence"
+                bandit_debug.setdefault("selection", {})["mode"] = "source_alignment_evidence_lock"
+            topic_complement_choice = None
+            topic_complement_reason: Dict[str, Any] = {}
+            source_anchored_topic_choice = None
+            source_anchored_topic_reason: Dict[str, Any] = {}
+            if bandit_enabled and hard_gate_arm == "defect_topic" and hard_gate_arm in best_candidate_by_source:
+                source_anchored_topic_choice, source_anchored_topic_reason = _select_source_anchored_topic_repair_candidate(
+                    hard_gate_arm=hard_gate_arm,
+                    chosen=best_candidate_by_source[hard_gate_arm],
+                    best_candidate_by_source=best_candidate_by_source,
+                    feedback=req.feedback if isinstance(req.feedback, dict) else {},
+                    rel_score=rel_score,
+                    rel_threshold=rel_threshold,
+                )
+                if source_anchored_topic_choice:
+                    chosen = source_anchored_topic_choice
+                    chosen_source = str(source_anchored_topic_choice.get("source", chosen_source))
+                    bandit_debug["hard_gate_softened"] = source_anchored_topic_reason
+                    bandit_debug["selected_arm"] = chosen_source
+                    bandit_debug.setdefault("selection", {})["mode"] = "hard_gate_source_anchored_topic_repair"
+                topic_complement_choice, topic_complement_reason = _select_stalled_topic_complement_candidate(
+                    hard_gate_arm=hard_gate_arm,
+                    chosen=best_candidate_by_source[hard_gate_arm],
+                    best_candidate_by_source=best_candidate_by_source,
+                    feedback=req.feedback if isinstance(req.feedback, dict) else {},
+                    rel_score=rel_score,
+                    rel_threshold=rel_threshold,
+                    iteration=iteration,
+                )
+                if topic_complement_choice and not source_anchored_topic_choice:
+                    chosen = topic_complement_choice
+                    chosen_source = str(topic_complement_choice.get("source", chosen_source))
+                    bandit_debug["hard_gate_softened"] = topic_complement_reason
+                    bandit_debug["selected_arm"] = chosen_source
+                    bandit_debug.setdefault("selection", {})["mode"] = "hard_gate_topic_complement"
+            if bandit_enabled and hard_gate_arm and hard_gate_arm in best_candidate_by_source:
+                no_harm_evidence_choice, no_harm_evidence_reason = _select_topic_hard_gate_no_harm_evidence_candidate(
+                    hard_gate_arm=hard_gate_arm,
+                    topic_candidate=best_candidate_by_source.get(hard_gate_arm),
+                    evidence_candidate=best_candidate_by_source.get("defect_evidence"),
+                    defect_graph=defect_graph,
+                    feedback=req.feedback if isinstance(req.feedback, dict) else {},
+                )
+                if no_harm_evidence_choice:
+                    chosen = no_harm_evidence_choice
+                    chosen_source = str(no_harm_evidence_choice.get("source", chosen_source))
+                    bandit_debug["hard_gate_softened"] = no_harm_evidence_reason
+                    bandit_debug["selected_arm"] = chosen_source
+                    bandit_debug.setdefault("selection", {})["mode"] = "hard_gate_no_harm_evidence"
+                aligned_hard_gate_softened = _should_soften_hard_gate_for_aligned_candidate(
+                    hard_gate_arm=hard_gate_arm,
+                    chosen_source=chosen_source,
+                    chosen=chosen or {},
+                    defect_graph=defect_graph,
+                    alignment_override=bandit_debug.get("defect_alignment_override", {}),
+                )
+                if aligned_hard_gate_softened:
+                    bandit_debug["hard_gate_softened"] = {
+                        "reason": "multi_defect_pareto_hard_gate_soften",
+                        "hard_gate_arm": hard_gate_arm,
+                        "selected_arm": chosen_source,
+                        "alignment_override": bandit_debug.get("defect_alignment_override", {}),
+                    }
+                    bandit_debug.setdefault("selection", {})["mode"] = "hard_gate_multi_defect_pareto"
+                if source_audit_evidence_lock or source_anchored_topic_choice or topic_complement_choice or no_harm_evidence_choice or aligned_hard_gate_softened:
+                    pass
+                elif chosen_source != hard_gate_arm:
+                    bandit_debug["hard_gate_lock"] = {
+                        "reason": "preserve_hard_verifier_gate_arm",
+                        "previous_arm": chosen_source,
+                        "locked_arm": hard_gate_arm,
+                    }
+                if not source_audit_evidence_lock and not source_anchored_topic_choice and not topic_complement_choice and not no_harm_evidence_choice and not aligned_hard_gate_softened:
+                    chosen = best_candidate_by_source[hard_gate_arm]
+                    chosen_source = hard_gate_arm
+                    bandit_debug["selected_arm"] = hard_gate_arm
+                    bandit_debug.setdefault("selection", {})["mode"] = "hard_defect_gate"
+
+            if (not bandit_enabled) and fixed_arm and fixed_arm in best_candidate_by_source:
+                if chosen_source != fixed_arm:
+                    bandit_debug["fixed_arm_override"] = {
+                        "reason": "no_bandit_fixed_strategy",
+                        "previous_arm": chosen_source,
+                        "fixed_arm": fixed_arm,
+                    }
+                chosen = best_candidate_by_source[fixed_arm]
+                chosen_source = fixed_arm
+                bandit_debug["selected_arm"] = fixed_arm
+
+            debug_selected_arm = str(bandit_debug.get("selected_arm") or "").strip()
+            if debug_selected_arm and debug_selected_arm in best_candidate_by_source:
+                actual_source = str((chosen or {}).get("source") or "").strip()
+                if actual_source != debug_selected_arm:
+                    bandit_debug["selection_consistency_fix"] = {
+                        "previous_candidate_source": actual_source,
+                        "debug_selected_arm": debug_selected_arm,
+                    }
+                    chosen = best_candidate_by_source[debug_selected_arm]
+                    chosen_source = debug_selected_arm
+
         changed = False
         score_gain = (chosen["score"]["total"] - baseline_score["total"]) if chosen else 0.0
         rel_anchor_gain = (chosen["score"].get("relevance_anchor", 0.0) - baseline_score.get("relevance_anchor", 0.0)) if chosen else 0.0
@@ -1638,11 +3708,31 @@ async def improve_outline(req: ImproveOutlineRequest):
         evidence_gain = (chosen["score"].get("evidence_signal", 0.0) - baseline_score.get("evidence_signal", 0.0)) if chosen else 0.0
 
         rel_needed = rel_score < rel_threshold
-        red_needed = red_score > red_threshold
+        failed_dims_for_accept = req.feedback.get("quality_dimensions_failed") if isinstance(req.feedback.get("quality_dimensions_failed"), list) else []
+        red_needed = bool(
+            red_score > red_threshold
+            or "novelty" in failed_dims_for_accept
+            or float(defect_graph.get("novelty", 0.0)) >= 0.02
+        )
         coherence_needed = bool(defect_graph.get("coherence", 0.0) >= 0.25 or "logical_coherence" in (req.feedback.get("quality_dimensions_failed") if isinstance(req.feedback.get("quality_dimensions_failed"), list) else []))
         evidence_needed = bool(defect_graph.get("evidence", 0.0) >= 0.25 or "evidence_grounding" in (req.feedback.get("quality_dimensions_failed") if isinstance(req.feedback.get("quality_dimensions_failed"), list) else []))
-        rel_gain_ok = (not rel_needed) or (rel_anchor_gain >= min_rel_anchor_gain) or (structure_gain >= min_structure_gain)
-        novelty_gain_ok = (not red_needed) or (novelty_gain >= min_novelty_gain)
+        rel_gain_ok = (
+            (not rel_needed)
+            or (rel_anchor_gain >= min_rel_anchor_gain)
+            or (structure_gain >= min_structure_gain)
+            or (
+                chosen_source == "defect_topic"
+                and float(defect_graph.get("hard_relevance_gate", 0.0) or 0.0) > 0.0
+            )
+        )
+        novelty_gain_ok = (
+            (not red_needed)
+            or (novelty_gain >= min_novelty_gain)
+            or (
+                chosen_source == "defect_novelty"
+                and float(defect_graph.get("hard_redundancy_gate", 0.0) or 0.0) > 0.0
+            )
+        )
         coherence_gain_ok = (not coherence_needed) or (coherence_gain >= min_coherence_gain) or (chosen_source in ("rule_structured", "defect_structure"))
         evidence_gain_ok = (not evidence_needed) or (evidence_gain >= min_evidence_gain) or (chosen_source == "defect_evidence" and chosen and chosen["score"].get("evidence_signal", 0.0) >= 0.75)
 
@@ -1678,12 +3768,14 @@ async def improve_outline(req: ImproveOutlineRequest):
         if bandit_enabled and chosen:
             selection_scores = (bandit_debug.get("selection") or {}).get("scores", {})
             predicted_exploit = float((selection_scores.get(chosen_source) or {}).get("exploit", 0.0))
-            reward_quality = _clip01(
-                max(0.0, score_gain) * 0.55
-                + max(0.0, rel_anchor_gain) * 0.20
-                + max(0.0, novelty_gain) * 0.15
-                + max(0.0, structure_gain) * 0.10
-                + max(0.0, evidence_gain) * 0.18
+            reward_quality = _controller_proposal_reward_quality(
+                chosen_source=chosen_source,
+                score_gain=score_gain,
+                rel_anchor_gain=rel_anchor_gain,
+                novelty_gain=novelty_gain,
+                structure_gain=structure_gain,
+                evidence_gain=evidence_gain,
+                defect_graph=defect_graph,
             )
 
             observed_cost, observed_latency = _estimate_arm_cost_latency(
@@ -1743,6 +3835,10 @@ async def improve_outline(req: ImproveOutlineRequest):
             _append_ope_event(
                 {
                     "timestamp": time.time(),
+                    "event_type": "controller_proposal",
+                    "document_id": req.document_id,
+                    "section_id": req.section_id,
+                    "subsection_id": req.subsection_id,
                     "state_path": _bandit_state_path(),
                     "chosen_arm": chosen_source,
                     "propensity": round(chosen_propensity, 6),
