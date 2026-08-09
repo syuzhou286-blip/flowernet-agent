@@ -46,6 +46,7 @@ from flowernet_agent_stack import (
     get_tool_registry,
     get_vector_store,
 )
+from evidence_drift_agent import EvidenceDriftResearchAgent
 
 _local_orchestrator_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flowernet_orchestrator_impl.py")
 _local_orchestrator_spec = importlib.util.spec_from_file_location("_flowernet_orchestrator_impl_local", _local_orchestrator_path)
@@ -113,6 +114,25 @@ class ProviderDiagnosticRequest(BaseModel):
     max_tokens: int = 80
 
 
+class EvidenceDriftEpisodeRequest(BaseModel):
+    episode_id: Optional[str] = None
+    mode: str = "live"
+    research_question: str = ""
+    report: str = ""
+    claims: List[Dict[str, Any]]
+    actions: List[Dict[str, Any]]
+    dependencies: List[Dict[str, Any]] = []
+    budget: float
+    cost_weight: float = 0.05
+
+
+class EvidenceDriftObservationRequest(BaseModel):
+    action_id: str
+    posteriors: Dict[str, float]
+    cost: Optional[float] = None
+    evidence: Dict[str, Any] = {}
+
+
 # ============ 全局对象 ============
 
 app = FastAPI(title="FlowerNet Generator API")
@@ -169,6 +189,7 @@ agent_task_queue = get_task_queue("flowernet:generator:tasks")
 vector_store = get_vector_store()
 eval_store = get_eval_store()
 tool_registry = get_tool_registry()
+evidence_drift_agent = EvidenceDriftResearchAgent(checkpoint_store=checkpoint_store)
 
 
 def _task_error_text(value: Any, fallback: str) -> str:
@@ -958,6 +979,63 @@ def get_agent_capabilities():
         "provider_chain": os.getenv("GENERATOR_PROVIDER_CHAIN", os.getenv("GENERATOR_PROVIDER", "")),
     }
     return {"success": True, "capabilities": caps}
+
+
+@app.post("/research/evidence-drift/episodes")
+async def create_evidence_drift_episode(request: EvidenceDriftEpisodeRequest):
+    """Create a live or frozen-replay RDO-VOI research episode."""
+    try:
+        return evidence_drift_agent.create_episode(request.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/research/evidence-drift/episodes/{episode_id}")
+async def get_evidence_drift_episode(episode_id: str):
+    try:
+        return evidence_drift_agent.get_episode(episode_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/research/evidence-drift/episodes/{episode_id}/plan")
+async def plan_evidence_drift_action(episode_id: str):
+    """Select the next budget-feasible epistemic action by expected VOI."""
+    try:
+        return evidence_drift_agent.plan(episode_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/research/evidence-drift/episodes/{episode_id}/observe")
+async def observe_evidence_drift_action(episode_id: str, request: EvidenceDriftObservationRequest):
+    """Submit a real tool/experiment observation; live outcomes are never fabricated."""
+    try:
+        payload = request.model_dump(exclude={"action_id"}, exclude_none=True)
+        return evidence_drift_agent.observe(episode_id, request.action_id, payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/research/evidence-drift/episodes/{episode_id}/replay-step")
+async def replay_evidence_drift_step(episode_id: str):
+    """Execute one frozen benchmark outcome; forbidden for live research episodes."""
+    try:
+        return evidence_drift_agent.replay_step(episode_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/research/evidence-drift/episodes/{episode_id}/finalize")
+async def finalize_evidence_drift_episode(episode_id: str):
+    try:
+        return evidence_drift_agent.finalize(episode_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get("/workflow/graph")

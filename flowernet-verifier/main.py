@@ -24,6 +24,7 @@ except Exception:
     _HAS_ST = False
 
 from history_store import HistoryManager
+from discourse_verifier import analyze_discourse
 
 _REVIEWER_MODULE_PATH = Path(__file__).resolve().parents[1] / "flowernet-generator" / "evolvable_reviewer.py"
 try:
@@ -1803,6 +1804,7 @@ class FlowerNetVerifier:
             coverage_diag=coverage_diagnostics,
             evidence_diag=evidence_diagnostics,
         )
+        discourse_diagnostics = analyze_discourse(draft, outline, history_list)
 
         heuristic_dimensions = self._compute_semantic_dimensions(
             draft=draft,
@@ -1816,6 +1818,14 @@ class FlowerNetVerifier:
             coverage_diag=coverage_diagnostics,
             evidence_diag=evidence_diagnostics,
             novelty_diagnostics=novelty_diagnostics,
+        )
+        # Do not replace semantic coherence with lexical continuity.  Fuse the
+        # two independent views so a fluent but disconnected paragraph and a
+        # lexically bridged but illogical paragraph can both be diagnosed.
+        semantic_coherence = self._safe_float(heuristic_dimensions.get("logical_coherence"), 0.0)
+        discourse_score = self._safe_float(discourse_diagnostics.get("discourse_delta"), 0.0)
+        heuristic_dimensions["logical_coherence"] = round(
+            self._clip01(0.62 * semantic_coherence + 0.38 * discourse_score), 4
         )
         
         require_multidim_env = (
@@ -1976,6 +1986,7 @@ class FlowerNetVerifier:
             "coverage_diagnostics": coverage_diagnostics,
             "evidence_diagnostics": evidence_diagnostics,
             "novelty_diagnostics": novelty_diagnostics,
+            "discourse_diagnostics": discourse_diagnostics,
             "raw_data": {
                 "relevancy": rel['details'],
                 "redundancy": red['details'],
@@ -1984,6 +1995,7 @@ class FlowerNetVerifier:
                 "coverage_diagnostics": coverage_diagnostics,
                 "evidence_diagnostics": evidence_diagnostics,
                 "novelty_diagnostics": novelty_diagnostics,
+                "discourse_diagnostics": discourse_diagnostics,
                 "semantic_dimensions": semantic_dimensions,
                 "semantic_uncertainty": fusion["uncertainty"],
             }

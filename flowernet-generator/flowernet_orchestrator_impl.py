@@ -97,6 +97,21 @@ except Exception:
     SELF_IMPROVING_HARNESS_AVAILABLE = False
 
 try:
+    from provenance_harness import propose_selective_repairs, validate_research_provenance
+    PROVENANCE_HARNESS_AVAILABLE = True
+except Exception:
+    propose_selective_repairs = None  # type: ignore
+    validate_research_provenance = None  # type: ignore
+    PROVENANCE_HARNESS_AVAILABLE = False
+
+try:
+    from evidence_drift_policy import select_drift_actions
+    EVIDENCE_DRIFT_POLICY_AVAILABLE = True
+except Exception:
+    select_drift_actions = None  # type: ignore
+    EVIDENCE_DRIFT_POLICY_AVAILABLE = False
+
+try:
     from research_memory import build_memory_record
     from harness_optimizer import build_harness_optimizer_record, recommended_flowernet_full_architecture
     MEMORY_OPTIMIZER_AVAILABLE = True
@@ -399,7 +414,25 @@ class DocumentGenerationOrchestrator:
                 "proposal_count": 0,
             }
         try:
-            return build_self_improving_harness_record(trace)
+            record = build_self_improving_harness_record(trace)
+            if PROVENANCE_HARNESS_AVAILABLE:
+                provenance_audit = validate_research_provenance(trace)
+                record["provenance_audit"] = provenance_audit
+                record["selective_repairs"] = propose_selective_repairs(provenance_audit)
+                record["provenance_hard_gate_passed"] = bool(provenance_audit.get("hard_gate_passed"))
+            else:
+                record["provenance_audit"] = {"available": False}
+                record["selective_repairs"] = []
+            drift = trace.get("evidence_drift")
+            if EVIDENCE_DRIFT_POLICY_AVAILABLE and isinstance(drift, dict):
+                record["evidence_drift_decision"] = select_drift_actions(
+                    drift.get("claims", []),
+                    drift.get("actions", []),
+                    dependencies=drift.get("dependencies", []),
+                    budget=float(drift.get("budget", 0.0) or 0.0),
+                    cost_weight=float(drift.get("cost_weight", 0.05) or 0.05),
+                )
+            return record
         except Exception as exc:
             return {
                 "enabled": True,
@@ -4504,6 +4537,8 @@ ACCEPTED BODY CONTEXT
                                 "research_intelligence": research_intelligence,
                                 "research_novelty": research_novelty,
                                 "claim_evidence_graph": claim_evidence_graph,
+                                "report": generated_content,
+                                "artifacts": subsection_gen_result.get("experiment_artifacts", []),
                                 "source_alignment_score": (
                                     float(source_alignment.get("score", 0.0) or 0.0)
                                     if isinstance(source_alignment, dict)
